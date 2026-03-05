@@ -76,6 +76,9 @@ class CodexAppServerClient:
         self._active_turn_by_thread: Dict[str, str] = {}
         self._token_usage_by_thread: Dict[str, Dict[str, Any]] = {}
         self._account_rate_limits: Dict[str, Any] = {}
+        self._turn_started_at_by_thread: Dict[str, float] = {}
+        self._turn_last_event_at_by_thread: Dict[str, float] = {}
+        self._turn_preview_by_thread: Dict[str, str] = {}
 
     def start(self, experimental_api: bool = True) -> Dict[str, Any]:
         if self.proc and self.proc.poll() is None and self._ready:
@@ -346,6 +349,23 @@ class CodexAppServerClient:
         with self._thread_status_lock:
             return dict(self._account_rate_limits)
 
+    def get_turn_progress(self, thread_id: str) -> Dict[str, Any]:
+        tid = str(thread_id or "")
+        with self._thread_status_lock:
+            turn_id = str(self._active_turn_by_thread.get(tid) or "")
+            started_at = float(self._turn_started_at_by_thread.get(tid) or 0.0)
+            last_event_at = float(self._turn_last_event_at_by_thread.get(tid) or 0.0)
+            preview = str(self._turn_preview_by_thread.get(tid) or "")
+        now = time.time()
+        elapsed = int(max(0.0, now - started_at)) if (turn_id and started_at > 0.0) else 0
+        return {
+            "turn_id": turn_id,
+            "started_at": int(started_at) if started_at > 0.0 else 0,
+            "elapsed_sec": elapsed,
+            "last_event_at": int(last_event_at) if last_event_at > 0.0 else 0,
+            "preview": preview,
+        }
+
     @staticmethod
     def extract_agent_text_from_turn(turn: Dict[str, Any]) -> str:
         items = turn.get("items") if isinstance(turn.get("items"), list) else []
@@ -426,14 +446,44 @@ class CodexAppServerClient:
             if thread_id and turn_id:
                 with self._thread_status_lock:
                     self._active_turn_by_thread[thread_id] = turn_id
+                    self._turn_started_at_by_thread[thread_id] = time.time()
+                    self._turn_last_event_at_by_thread[thread_id] = time.time()
+                    self._turn_preview_by_thread[thread_id] = ""
         elif method == "turn/completed":
             thread_id = str(params.get("threadId") or "")
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             turn_id = str(turn.get("id") or "")
             if thread_id and turn_id:
                 with self._thread_status_lock:
+                    self._turn_last_event_at_by_thread[thread_id] = time.time()
                     if self._active_turn_by_thread.get(thread_id) == turn_id:
                         self._active_turn_by_thread.pop(thread_id, None)
+                        self._turn_started_at_by_thread.pop(thread_id, None)
+                        # Keep preview for short-term status visibility after completion.
+        elif method == "item/agentMessage/delta":
+            thread_id = str(params.get("threadId") or "")
+            turn_id = str(params.get("turnId") or "")
+            delta = str(params.get("delta") or "")
+            if thread_id and turn_id and delta:
+                with self._thread_status_lock:
+                    if self._active_turn_by_thread.get(thread_id) == turn_id:
+                        cur = str(self._turn_preview_by_thread.get(thread_id) or "")
+                        merged = (cur + delta).strip()
+                        if len(merged) > 1200:
+                            merged = merged[-1200:]
+                        self._turn_preview_by_thread[thread_id] = merged
+                        self._turn_last_event_at_by_thread[thread_id] = time.time()
+        elif method == "item/completed":
+            thread_id = str(params.get("threadId") or "")
+            turn_id = str(params.get("turnId") or "")
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            if thread_id and turn_id and str(item.get("type") or "") == "agentMessage":
+                txt = str(item.get("text") or "").strip()
+                if txt:
+                    with self._thread_status_lock:
+                        if self._active_turn_by_thread.get(thread_id) == turn_id:
+                            self._turn_preview_by_thread[thread_id] = txt[-1200:]
+                            self._turn_last_event_at_by_thread[thread_id] = time.time()
 
         self._notifications.put(msg)
 

@@ -48,7 +48,8 @@ SINGLE_CHAT_ONLY = str(os.getenv("BRIDGE_SINGLE_CHAT_ONLY", "true")).strip().low
 CONTROL_BASE = str(os.getenv("BRIDGE_CONTROL_BASE", "http://127.0.0.1:18788")).strip().rstrip("/")
 API_PREFIX = str(os.getenv("BRIDGE_API_PREFIX", "/appbridge/api")).strip()
 API_TOKEN = str(os.getenv("BRIDGE_API_TOKEN", "")).strip()
-TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "180")))
+TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "21600")))
+PROGRESS_PING_INTERVAL_SEC = max(30, int(os.getenv("BRIDGE_PROGRESS_PING_INTERVAL_SEC", "180")))
 UPLOAD_ROOT = Path(os.getenv("BRIDGE_UPLOAD_ROOT", str(APP_DIR / "data" / "uploads"))).expanduser()
 if not UPLOAD_ROOT.is_absolute():
     UPLOAD_ROOT = APP_DIR / UPLOAD_ROOT
@@ -271,6 +272,58 @@ class FeishuClient:
     def send_text(self, chat_id: str, text: str) -> None:
         self.send_text_by_receive_id(chat_id, text, receive_id_type="chat_id")
 
+    def reply_text(self, message_id: str, text: str) -> str:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return ""
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}/reply"
+        payload = {
+            "msg_type": "text",
+            "content": json.dumps({"text": str(text or "")}, ensure_ascii=False),
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"reply_text failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"reply_text feishu err: {data}")
+        out = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return str(out.get("message_id") or "").strip()
+
+    def update_text(self, message_id: str, text: str) -> None:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}"
+        payload = {
+            "msg_type": "text",
+            "content": json.dumps({"text": str(text or "")}, ensure_ascii=False),
+        }
+        resp = requests.put(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"update_text failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"update_text feishu err: {data}")
+
+    def delete_message(self, message_id: str) -> None:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}"
+        resp = requests.delete(url, headers=headers, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"delete_message failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"delete_message feishu err: {data}")
+
     def send_card(self, chat_id: str, card: Dict[str, Any]) -> None:
         token = self._tenant_access_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -299,7 +352,10 @@ class FeishuClient:
             "user_ids": [open_id],
             "app_feed_card": {
                 "biz_id": biz,
-                "status_label": {"text": str(text or "🤖 正在回复")},
+                "status_label": {
+                    "text": str(text or "🤖 正在回复"),
+                    "type": "primary",
+                },
             },
         }
         try:
@@ -752,6 +808,40 @@ class AppServerBotBridge:
             + ("\n" + "\n".join(usage_lines) if usage_lines else "")
         )
 
+    def _progress_ping_text(self, chat_id: str, started_at: float) -> str:
+        data = self._status_data(chat_id)
+        elapsed = max(0, int(time.time() - float(started_at or time.time())))
+        mins, secs = divmod(elapsed, 60)
+        active_turn = str(data.get("active_turn_id") or "<none>")
+        thread_status = data.get("thread_status") if isinstance(data.get("thread_status"), dict) else {}
+        progress = data.get("turn_progress") if isinstance(data.get("turn_progress"), dict) else {}
+        preview = _trim(str(progress.get("preview") or "").strip().replace("\n", " "), 320)
+        lines = [
+            f"⏳ 任务仍在执行（{mins}m{secs:02d}s）",
+            f"turn={active_turn}",
+            f"thread_status={json.dumps(thread_status, ensure_ascii=False)}",
+        ]
+        if preview:
+            lines.append(f"current: {preview}")
+        return "\n".join(lines)
+
+    def _progress_ping_loop(
+        self,
+        chat_id: str,
+        started_at: float,
+        stop_event: threading.Event,
+        reply_tip_mid: str,
+    ) -> None:
+        while not stop_event.wait(PROGRESS_PING_INTERVAL_SEC):
+            try:
+                text = self._progress_ping_text(chat_id=chat_id, started_at=started_at)
+                if reply_tip_mid:
+                    self.feishu.update_text(reply_tip_mid, text)
+                else:
+                    self.feishu.send_text(chat_id, text)
+            except Exception as exc:
+                LOG.warning("progress ping failed chat_id=%s err=%s", chat_id, exc)
+
     def _run_turn(self, chat_id: str, text: str, image_paths: Optional[List[str]] = None) -> str:
         resp = self.control.turn(chat_id=chat_id, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
@@ -960,6 +1050,11 @@ class AppServerBotBridge:
         pending_files = self._consume_pending_files(chat_id)
         prompt, image_paths = self._build_prompt_with_files(raw, pending_files)
         typing_biz_id = ""
+        has_app_feed_status = False
+        reply_tip_mid = ""
+        reply_tip_consumed = False
+        progress_stop = threading.Event()
+        progress_thread: Optional[threading.Thread] = None
         sender_open_id = str(sender_open_id or "").strip()
         if sender_open_id:
             msg = str(message_id or "").strip()
@@ -967,30 +1062,94 @@ class AppServerBotBridge:
                 typing_biz_id = f"typing:{msg}"
             else:
                 typing_biz_id = f"typing:{chat_id}:{int(time.time() * 1000)}"
-            self.feishu.create_reply_status(sender_open_id, typing_biz_id, "🤖 正在回复")
+            has_app_feed_status = self.feishu.create_reply_status(sender_open_id, typing_biz_id, "🤖 正在回复")
+        if (not has_app_feed_status) and str(message_id or "").strip():
+            try:
+                reply_tip_mid = self.feishu.reply_text(str(message_id), "🤖 正在回复...")
+            except Exception as exc:
+                LOG.warning("reply tip create failed message_id=%s err=%s", message_id or "<none>", exc)
 
         try:
             lock = self._chat_lock(chat_id)
             if not lock.acquire(blocking=False):
+                LOG.info("chat busy, steering message chat_id=%s message_id=%s", chat_id, message_id or "<none>")
                 try:
                     self.control.steer(chat_id=chat_id, text=prompt, image_paths=image_paths)
+                    if reply_tip_mid:
+                        try:
+                            self.feishu.delete_message(reply_tip_mid)
+                        except Exception as exc:
+                            LOG.warning("reply tip delete failed message_id=%s err=%s", reply_tip_mid, exc)
                 except Exception as steer_exc:
                     queued = self._enqueue_input(chat_id=chat_id, text=prompt, image_paths=image_paths)
-                    self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
+                    if reply_tip_mid:
+                        try:
+                            self.feishu.update_text(reply_tip_mid, f"已加入队列（第{queued}条）")
+                            reply_tip_consumed = True
+                        except Exception as exc:
+                            LOG.warning("reply tip update failed message_id=%s err=%s", reply_tip_mid, exc)
+                            self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
+                    else:
+                        self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
                 return
             try:
+                start = time.time()
+                LOG.info("turn start chat_id=%s message_id=%s", chat_id, message_id or "<none>")
+                progress_thread = threading.Thread(
+                    target=self._progress_ping_loop,
+                    args=(chat_id, start, progress_stop, reply_tip_mid),
+                    daemon=True,
+                )
+                progress_thread.start()
                 if pending_files:
                     self.feishu.send_text(chat_id, f"检测到 {len(pending_files)} 个附件，已自动带入本轮对话。")
                 answer = self._run_turn(chat_id=chat_id, text=prompt, image_paths=image_paths)
-                self.feishu.send_text(chat_id, answer)
+                progress_stop.set()
+                if progress_thread:
+                    progress_thread.join(timeout=1.0)
+                if reply_tip_mid:
+                    chunks = _split_text(answer, 1500)
+                    try:
+                        self.feishu.update_text(reply_tip_mid, chunks[0] if chunks else "(assistant returned empty text)")
+                        reply_tip_consumed = True
+                        for extra in chunks[1:]:
+                            self.feishu.send_text(chat_id, extra)
+                    except Exception as exc:
+                        LOG.warning("reply tip update final failed message_id=%s err=%s", reply_tip_mid, exc)
+                        self.feishu.send_text(chat_id, answer)
+                else:
+                    self.feishu.send_text(chat_id, answer)
                 self._drain_queued_inputs(chat_id)
+                LOG.info("turn done chat_id=%s message_id=%s elapsed=%.3fs", chat_id, message_id or "<none>", time.time() - start)
             except Exception as exc:
-                self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
+                LOG.exception("turn failed chat_id=%s message_id=%s", chat_id, message_id or "<none>")
+                progress_stop.set()
+                if progress_thread:
+                    progress_thread.join(timeout=1.0)
+                if reply_tip_mid:
+                    try:
+                        self.feishu.update_text(reply_tip_mid, f"处理失败:\n{exc}")
+                        reply_tip_consumed = True
+                    except Exception:
+                        self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
+                else:
+                    self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
             finally:
+                progress_stop.set()
+                if progress_thread and progress_thread.is_alive():
+                    progress_thread.join(timeout=0.5)
                 lock.release()
         finally:
-            if typing_biz_id and sender_open_id:
+            progress_stop.set()
+            if progress_thread and progress_thread.is_alive():
+                progress_thread.join(timeout=0.5)
+            if typing_biz_id and sender_open_id and has_app_feed_status:
                 self.feishu.delete_reply_status(sender_open_id, typing_biz_id)
+            if reply_tip_mid and (not reply_tip_consumed):
+                try:
+                    self.feishu.delete_message(reply_tip_mid)
+                except Exception as exc:
+                    LOG.warning("reply tip cleanup failed message_id=%s err=%s", reply_tip_mid, exc)
 
     def _handle_event(self, payload: Dict[str, Any]) -> None:
         header = payload.get("header") if isinstance(payload.get("header"), dict) else {}

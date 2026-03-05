@@ -59,6 +59,8 @@
 - 状态文件：`./data/state.json`
 - 上传目录：`./data/uploads`
 - 默认工作目录：`.`
+- 单轮超时：`BRIDGE_TURN_TIMEOUT_SEC=21600`（默认 6 小时）
+- 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
 
 `app.py` 和 `long_conn.py` 都会自动加载 `.env`。
 

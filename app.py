@@ -30,7 +30,7 @@ DEFAULT_MODEL = os.environ.get("BRIDGE_DEFAULT_MODEL", "gpt-5.3-codex")
 DEFAULT_SANDBOX = os.environ.get("BRIDGE_DEFAULT_SANDBOX", "danger-full-access")
 DEFAULT_APPROVAL = os.environ.get("BRIDGE_DEFAULT_APPROVAL_POLICY", "never")
 DEFAULT_PERSONALITY = os.environ.get("BRIDGE_DEFAULT_PERSONALITY", "pragmatic")
-DEFAULT_TURN_TIMEOUT_SEC = int(os.environ.get("BRIDGE_TURN_TIMEOUT_SEC", "180"))
+DEFAULT_TURN_TIMEOUT_SEC = int(os.environ.get("BRIDGE_TURN_TIMEOUT_SEC", "21600"))
 
 _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
@@ -46,7 +46,7 @@ class TurnRequest(BaseModel):
     sandbox: str = Field(default="")
     approval_policy: str = Field(default="")
     personality: str = Field(default="")
-    timeout_sec: int = Field(default=DEFAULT_TURN_TIMEOUT_SEC, ge=5, le=1800)
+    timeout_sec: int = Field(default=DEFAULT_TURN_TIMEOUT_SEC, ge=5)
     reset_thread: bool = Field(default=False)
 
 
@@ -246,12 +246,14 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
     thread_status: Dict[str, Any] = {}
     token_usage: Dict[str, Any] = {}
     rate_limits: Dict[str, Any] = {}
+    turn_progress: Dict[str, Any] = {}
     active_turn_id = str(runtime.active_turn_id or persisted.get("active_turn_id") or "")
 
     if thread_id and runtime.is_client_running():
         thread_status = runtime.client.get_thread_status(thread_id)
         token_usage = runtime.client.get_thread_token_usage(thread_id)
         rate_limits = _read_rate_limits(runtime)
+        turn_progress = runtime.client.get_turn_progress(thread_id)
         if not active_turn_id:
             active_turn_id = runtime.client.get_active_turn_id(thread_id)
     if not rate_limits:
@@ -270,6 +272,7 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
             "thread_status": thread_status,
             "token_usage": token_usage,
             "rate_limits": rate_limits,
+            "turn_progress": turn_progress,
             "cwd": str(runtime.cwd or persisted.get("cwd") or DEFAULT_CWD),
             "model": str(runtime.model or persisted.get("model") or DEFAULT_MODEL),
             "sandbox": str(runtime.sandbox or persisted.get("sandbox") or DEFAULT_SANDBOX),
