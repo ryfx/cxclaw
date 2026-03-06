@@ -10,6 +10,11 @@ __pycache__/
 .env.*
 !.env.example
 *.log
+state.json
+config.json
+config.local.json
+*.pem
+*.key
 
 # Runtime state/uploads
 data/*

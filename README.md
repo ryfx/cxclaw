@@ -8,6 +8,7 @@
 - 附件消息自动下载并暂存，供下一轮对话使用。
 - 菜单点击可打开项目/会话管理卡片。
 - 卡片交互支持项目切换、会话管理、模型切换等流程。
+- 会话在无任务执行且 10 分钟无新消息时自动回收，后续可通过 Codex `resume` 恢复。
 
 ## 前置条件
 
@@ -61,6 +62,8 @@
 - 默认工作目录：`.`
 - 单轮超时：`BRIDGE_TURN_TIMEOUT_SEC=21600`（默认 6 小时）
 - 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
+- 空闲会话回收：`BRIDGE_IDLE_EVICT_SEC=600`（默认 10 分钟）
+- 回收扫描间隔：`BRIDGE_IDLE_SWEEP_INTERVAL_SEC=60`（默认 60 秒）
 
 `app.py` 和 `long_conn.py` 都会自动加载 `.env`。
 

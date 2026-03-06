@@ -31,6 +31,8 @@ DEFAULT_SANDBOX = os.environ.get("BRIDGE_DEFAULT_SANDBOX", "danger-full-access")
 DEFAULT_APPROVAL = os.environ.get("BRIDGE_DEFAULT_APPROVAL_POLICY", "never")
 DEFAULT_PERSONALITY = os.environ.get("BRIDGE_DEFAULT_PERSONALITY", "pragmatic")
 DEFAULT_TURN_TIMEOUT_SEC = int(os.environ.get("BRIDGE_TURN_TIMEOUT_SEC", "21600"))
+IDLE_EVICT_SEC = max(0, int(os.environ.get("BRIDGE_IDLE_EVICT_SEC", "600")))
+IDLE_SWEEP_INTERVAL_SEC = max(10, int(os.environ.get("BRIDGE_IDLE_SWEEP_INTERVAL_SEC", "60")))
 
 _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
@@ -46,7 +48,7 @@ class TurnRequest(BaseModel):
     sandbox: str = Field(default="")
     approval_policy: str = Field(default="")
     personality: str = Field(default="")
-    timeout_sec: int = Field(default=DEFAULT_TURN_TIMEOUT_SEC, ge=5)
+    timeout_sec: int = Field(default=DEFAULT_TURN_TIMEOUT_SEC, ge=5, le=86400)
     reset_thread: bool = Field(default=False)
 
 
@@ -78,6 +80,7 @@ class ChatRuntime:
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL
     personality: str = DEFAULT_PERSONALITY
+    last_input_at: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
     client: CodexAppServerClient = field(default_factory=CodexAppServerClient)
 
@@ -107,6 +110,7 @@ class BridgeRuntimeManager:
                 sandbox=str(persisted.get("sandbox") or DEFAULT_SANDBOX),
                 approval_policy=str(persisted.get("approval_policy") or DEFAULT_APPROVAL),
                 personality=str(persisted.get("personality") or DEFAULT_PERSONALITY),
+                last_input_at=int(persisted.get("last_input_at") or persisted.get("updated_at") or 0),
             )
             self._runtimes[clean_chat_id] = runtime
             return runtime
@@ -114,6 +118,52 @@ class BridgeRuntimeManager:
     def runtimes_count(self) -> int:
         with self._lock:
             return len(self._runtimes)
+
+    def evict_idle(self, idle_sec: int) -> int:
+        if idle_sec <= 0:
+            return 0
+        now = int(time.time())
+        with self._lock:
+            items = list(self._runtimes.items())
+        evicted = 0
+        for chat_id, runtime in items:
+            if not runtime.lock.acquire(blocking=False):
+                continue
+            try:
+                if runtime.thread_id and runtime.is_client_running():
+                    active_turn = str(runtime.client.get_active_turn_id(runtime.thread_id) or "")
+                    runtime.active_turn_id = active_turn
+                else:
+                    active_turn = ""
+                    if runtime.active_turn_id:
+                        runtime.active_turn_id = ""
+                        STORE.upsert_chat(chat_id, {"active_turn_id": ""})
+                if active_turn:
+                    continue
+
+                last_input_at = int(runtime.last_input_at or 0)
+                if last_input_at <= 0:
+                    persisted = STORE.get_chat(chat_id)
+                    last_input_at = int(persisted.get("last_input_at") or persisted.get("updated_at") or 0)
+                    runtime.last_input_at = last_input_at
+                if last_input_at <= 0:
+                    continue
+                if (now - last_input_at) < int(idle_sec):
+                    continue
+
+                if runtime.is_client_running():
+                    runtime.client.stop()
+                with self._lock:
+                    cur = self._runtimes.get(chat_id)
+                    if cur is runtime:
+                        self._runtimes.pop(chat_id, None)
+                        evicted += 1
+                LOG.info("evicted idle runtime chat_id=%s idle_sec=%s", chat_id, now - last_input_at)
+            except Exception as exc:
+                LOG.warning("evict idle failed chat_id=%s err=%s", chat_id, exc)
+            finally:
+                runtime.lock.release()
+        return evicted
 
     def stop_all(self) -> None:
         with self._lock:
@@ -127,6 +177,24 @@ class BridgeRuntimeManager:
 
 RUNTIMES = BridgeRuntimeManager()
 atexit.register(RUNTIMES.stop_all)
+_IDLE_SWEEPER_STOP = threading.Event()
+_IDLE_SWEEPER_THREAD: Optional[threading.Thread] = None
+
+
+def _idle_sweeper_loop() -> None:
+    LOG.info(
+        "idle sweeper started idle_evict_sec=%s interval_sec=%s",
+        IDLE_EVICT_SEC,
+        IDLE_SWEEP_INTERVAL_SEC,
+    )
+    while not _IDLE_SWEEPER_STOP.wait(IDLE_SWEEP_INTERVAL_SEC):
+        try:
+            evicted = RUNTIMES.evict_idle(IDLE_EVICT_SEC)
+            if evicted > 0:
+                LOG.info("idle sweeper evicted=%s active_runtime_chats=%s", evicted, RUNTIMES.runtimes_count())
+        except Exception as exc:
+            LOG.warning("idle sweeper iteration failed err=%s", exc)
+    LOG.info("idle sweeper stopped")
 
 
 def _extract_bearer_token(authorization: str) -> str:
@@ -164,16 +232,19 @@ def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = Non
         "sandbox": runtime.sandbox,
         "approval_policy": runtime.approval_policy,
         "personality": runtime.personality,
+        "last_input_at": int(runtime.last_input_at or 0),
     }
     if patch:
         data.update(patch)
     return STORE.upsert_chat(runtime.chat_id, data)
 
 
-def _read_rate_limits(runtime: ChatRuntime) -> Dict[str, Any]:
+def _read_rate_limits(runtime: ChatRuntime, allow_request: bool = True) -> Dict[str, Any]:
     cached = runtime.client.get_account_rate_limits()
     if cached:
         return cached
+    if not allow_request:
+        return {}
     try:
         read = runtime.client.account_rate_limits_read()
         if isinstance(read.get("rateLimits"), dict):
@@ -229,11 +300,16 @@ ROUTER = APIRouter(prefix=API_PREFIX)
 
 @APP.get("/healthz")
 def healthz() -> Dict[str, Any]:
+    sweeper_alive = bool(_IDLE_SWEEPER_THREAD and _IDLE_SWEEPER_THREAD.is_alive())
     return {
         "ok": True,
         "service": "feicodex-rocket-bridge",
         "api_prefix": API_PREFIX,
         "active_runtime_chats": RUNTIMES.runtimes_count(),
+        "idle_evict_sec": IDLE_EVICT_SEC,
+        "idle_sweep_interval_sec": IDLE_SWEEP_INTERVAL_SEC,
+        "idle_sweeper_enabled": bool(IDLE_EVICT_SEC > 0),
+        "idle_sweeper_alive": sweeper_alive,
         "timestamp": int(time.time()),
     }
 
@@ -254,10 +330,14 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
         token_usage = runtime.client.get_thread_token_usage(thread_id)
         rate_limits = _read_rate_limits(runtime)
         turn_progress = runtime.client.get_turn_progress(thread_id)
-        if not active_turn_id:
-            active_turn_id = runtime.client.get_active_turn_id(thread_id)
+        client_active_turn_id = str(runtime.client.get_active_turn_id(thread_id) or "")
+        if client_active_turn_id:
+            active_turn_id = client_active_turn_id
+        elif str(thread_status.get("type") or "").lower() == "idle":
+            # app-server reports idle, so persisted active turn id is stale.
+            active_turn_id = ""
     if not rate_limits:
-        rate_limits = _read_rate_limits(runtime)
+        rate_limits = _read_rate_limits(runtime, allow_request=False)
     if not token_usage and isinstance(persisted.get("last_token_usage"), dict):
         token_usage = dict(persisted.get("last_token_usage") or {})
     if not rate_limits and isinstance(persisted.get("last_rate_limits"), dict):
@@ -287,6 +367,7 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
 def chat_thread_reset(chat_id: str, body: ResetThreadRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     with runtime.lock:
+        runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
         runtime.active_turn_id = ""
         try:
@@ -314,6 +395,7 @@ def chat_thread_reset(chat_id: str, body: ResetThreadRequest) -> Dict[str, Any]:
 def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     with runtime.lock:
+        runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
         try:
             thread_id = _ensure_thread(runtime, reset_thread=bool(body.reset_thread))
@@ -323,7 +405,10 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 status_code=502,
                 detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
             ) from exc
-        active_now = str(runtime.active_turn_id or runtime.client.get_active_turn_id(thread_id))
+        active_now = str(runtime.client.get_active_turn_id(thread_id) or "")
+        if active_now != str(runtime.active_turn_id or ""):
+            runtime.active_turn_id = active_now
+            _persist_runtime(runtime)
         if active_now and not bool(body.reset_thread):
             state = _persist_runtime(runtime, {"last_error": "turn already running", "last_turn_status": "running"})
             raise HTTPException(
@@ -430,6 +515,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
 def chat_turn_steer(chat_id: str, body: SteerTurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     with runtime.lock:
+        runtime.last_input_at = int(time.time())
         try:
             thread_id = _ensure_thread(runtime, reset_thread=False)
         except AppServerError as exc:
@@ -491,6 +577,7 @@ def chat_turn_steer(chat_id: str, body: SteerTurnRequest) -> Dict[str, Any]:
 def chat_interrupt(chat_id: str, body: InterruptTurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     with runtime.lock:
+        runtime.last_input_at = int(time.time())
         thread_id = str(runtime.thread_id or "")
         if not thread_id:
             return {"ok": True, "message": "no active thread"}
@@ -520,6 +607,24 @@ def chat_interrupt(chat_id: str, body: InterruptTurnRequest) -> Dict[str, Any]:
 APP.include_router(ROUTER)
 
 
+@APP.on_event("startup")
+def _on_startup() -> None:
+    global _IDLE_SWEEPER_THREAD
+    if IDLE_EVICT_SEC <= 0:
+        LOG.info("idle sweeper disabled idle_evict_sec=%s", IDLE_EVICT_SEC)
+        return
+    _IDLE_SWEEPER_STOP.clear()
+    t = _IDLE_SWEEPER_THREAD
+    if t and t.is_alive():
+        return
+    _IDLE_SWEEPER_THREAD = threading.Thread(target=_idle_sweeper_loop, name="idle-sweeper", daemon=True)
+    _IDLE_SWEEPER_THREAD.start()
+
+
 @APP.on_event("shutdown")
 def _on_shutdown() -> None:
+    _IDLE_SWEEPER_STOP.set()
+    t = _IDLE_SWEEPER_THREAD
+    if t and t.is_alive():
+        t.join(timeout=2.0)
     RUNTIMES.stop_all()
