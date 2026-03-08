@@ -83,6 +83,10 @@
 - 账号源文件目录：`./data/auth_profiles`
 - 账号运行目录：`./data/auth_homes`
 - 默认工作目录：`.`
+- 默认模型：`BRIDGE_DEFAULT_MODEL=gpt-5.3-codex`
+- 默认沙箱：`BRIDGE_DEFAULT_SANDBOX=danger-full-access`
+- 默认审批策略：`BRIDGE_DEFAULT_APPROVAL_POLICY=never`
+- 默认人格：`BRIDGE_DEFAULT_PERSONALITY=pragmatic`
 - 单轮超时：`BRIDGE_TURN_TIMEOUT_SEC=21600`（默认 6 小时）
 - 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
 - streaming card 刷新间隔：`BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC=5`（默认每 5 秒）
@@ -93,6 +97,11 @@
 - 自动切号阈值：`BRIDGE_AUTO_AUTH_SWITCH_THRESHOLD_PCT=100`
 - streaming card：`BRIDGE_STREAMING_CARD_ENABLED=true`
 - typing reaction：`BRIDGE_TYPING_REACTION_ENABLED=true`
+- 卡片按钮后自动删卡：`BRIDGE_CARD_AUTO_DELETE_ON_ACTION=true`
+- 输出文件自动回传：`BRIDGE_OUTPUT_FILE_AUTO_SEND=true`
+- 输出文件数量上限：`BRIDGE_OUTPUT_FILE_MAX_COUNT=0`
+- 输出文件大小上限：`BRIDGE_OUTPUT_FILE_MAX_SIZE_MB=30`
+- 输出文件扫描年龄：`BRIDGE_OUTPUT_FILE_MAX_AGE_SEC=3600`
 
 `app.py` 和 `long_conn.py` 都会自动加载 `.env`。
 
@@ -103,9 +112,11 @@
 - `GET /chat/{chat_id}/status`
 - `GET /history`
 - `GET /auth/profiles`
+- `POST /chat/{chat_id}/config`
 - `POST /chat/{chat_id}/auth-profile`
 - `POST /chat/{chat_id}/thread/reset`
 - `POST /chat/{chat_id}/turn`
+- `POST /chat/{chat_id}/turn/steer`
 - `POST /chat/{chat_id}/interrupt`
 
 鉴权头：
@@ -123,6 +134,10 @@
 - `HISTORY_ALLOWED_OPEN_IDS=ou_xxx`
 - `HISTORY_SESSION_SECRET=...`
 - `HISTORY_SESSION_TTL_SEC=604800`
+- `HISTORY_COOKIE_NAME=feicodex_history_session`
+- `FEISHU_OAUTH_AUTHORIZE_URL=...`
+- `FEISHU_OAUTH_TOKEN_URL=...`
+- `FEISHU_OAUTH_USERINFO_URL=...`
 
 页面会按：
 
@@ -141,7 +156,7 @@
 
 对机器侧保留：
 
-- `GET /appbridge/api/history`
+- `GET /appbridge/api/history?offset=0&limit=50`
 
 对网页侧新增分层接口：
 
