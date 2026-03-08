@@ -940,9 +940,14 @@ class FeishuStreamingCardSession:
             if self.closed:
                 return
             final_merged = _merge_streaming_text(self.current_text, final_text)
+            update_err: Optional[Exception] = None
             if final_merged and final_merged != self.current_text:
                 self.current_text = final_merged
-                self._update_content(_final_stream_card_text(final_merged))
+                try:
+                    self._update_content(_final_stream_card_text(final_merged))
+                except Exception as exc:
+                    update_err = exc
+                    LOG.warning("stream card final content update failed card_id=%s err=%s", self.card_id or "<none>", exc)
             _clear_final_stream_card_state(self.message_id)
             self.sequence += 1
             token = self.feishu._tenant_access_token()
@@ -967,8 +972,13 @@ class FeishuStreamingCardSession:
                 timeout=20,
             )
             if resp.status_code >= 300:
-                raise RuntimeError(f"stream card close failed status={resp.status_code} body={resp.text}")
+                raise RuntimeError(
+                    f"stream card close failed status={resp.status_code} body={resp.text}"
+                    + (f"; final_update_err={update_err}" if update_err else "")
+                )
             self.closed = True
+            if update_err:
+                raise RuntimeError(f"stream card final content update failed: {update_err}")
 
     def is_active(self) -> bool:
         return bool(self.card_id) and not self.closed
@@ -2025,7 +2035,8 @@ class AppServerBotBridge:
                         streaming_card.close(answer)
                     except Exception as exc:
                         LOG.warning("stream card close failed message_id=%s err=%s", message_id or "<none>", exc)
-                        self.feishu.smart_send(chat_id, answer)
+                        if not str(streaming_card.message_id or "").strip():
+                            self.feishu.smart_send(chat_id, answer)
                 else:
                     self.feishu.smart_send(chat_id, answer)
                 self._send_output_files(chat_id, output_files)
@@ -2040,7 +2051,8 @@ class AppServerBotBridge:
                     try:
                         streaming_card.close(f"处理失败:\n{exc}")
                     except Exception:
-                        self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
+                        if not str(streaming_card.message_id or "").strip():
+                            self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
                 else:
                     self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
             finally:
