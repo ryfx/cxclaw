@@ -113,6 +113,17 @@ DEFAULT_PROJECTS = {
 SUPPORTED_ATTACHMENT_TYPES = {"image", "file", "media", "audio", "video", "sticker"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 SUPPORTED_EFFORTS = ["medium", "high", "xhigh"]
+FINAL_STREAM_CARD_PREVIEW_LEN = 900
+FINAL_STREAM_CARD_PAGE_LEN = 2200
+FINAL_STREAM_CARD_ACTIONS = {
+    "stream_final_expand",
+    "stream_final_collapse",
+    "stream_final_prev",
+    "stream_final_next",
+}
+
+_FINAL_STREAM_CARD_STATE_LOCK = threading.Lock()
+_FINAL_STREAM_CARD_STATE: Dict[str, Dict[str, Any]] = {}
 
 
 def _safe_str(value: Any) -> str:
@@ -300,7 +311,7 @@ def _merge_streaming_text(previous_text: str, next_text: str) -> str:
     return nxt
 
 
-def _final_stream_card_text(text: str, max_chunk_len: int = 900) -> str:
+def _final_stream_card_text(text: str, max_chunk_len: int = FINAL_STREAM_CARD_PREVIEW_LEN) -> str:
     raw = str(text or "").strip()
     if len(raw) <= max_chunk_len:
         return raw
@@ -310,6 +321,117 @@ def _final_stream_card_text(text: str, max_chunk_len: int = 900) -> str:
     preview_limit = max(120, max_chunk_len - len(footer))
     preview = _trim(raw, preview_limit).rstrip()
     return f"{preview}{footer}"
+
+
+def _build_final_stream_card(text: str, expanded: bool = False, page_index: int = 0) -> Tuple[Dict[str, Any], bool]:
+    raw = str(text or "").strip()
+    if not raw:
+        raw = "(empty)"
+    pages = _text_to_card_chunks(raw, max_len=FINAL_STREAM_CARD_PAGE_LEN)
+    is_long = len(raw) > FINAL_STREAM_CARD_PREVIEW_LEN or len(pages) > 1
+    elements: List[Dict[str, Any]] = []
+    if not is_long:
+        elements.append({"tag": "markdown", "content": raw})
+        return (
+            {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "body": {"elements": elements},
+            },
+            False,
+        )
+
+    if not expanded:
+        elements.append({"tag": "markdown", "content": _final_stream_card_text(raw, FINAL_STREAM_CARD_PREVIEW_LEN)})
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "type": "primary",
+                        "text": {"tag": "plain_text", "content": "展开"},
+                        "value": {"op": "stream_final_expand"},
+                    }
+                ],
+            }
+        )
+    else:
+        idx = min(max(0, int(page_index or 0)), len(pages) - 1)
+        content = pages[idx]
+        if len(pages) > 1:
+            content = f"{content}\n\n---\n第 {idx + 1}/{len(pages)} 段"
+        actions: List[Dict[str, Any]] = []
+        if idx > 0:
+            actions.append(
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "上一段"},
+                    "value": {"op": "stream_final_prev"},
+                }
+            )
+        if idx < len(pages) - 1:
+            actions.append(
+                {
+                    "tag": "button",
+                    "type": "primary",
+                    "text": {"tag": "plain_text", "content": "下一段"},
+                    "value": {"op": "stream_final_next"},
+                }
+            )
+        actions.append(
+            {
+                "tag": "button",
+                "type": "default",
+                "text": {"tag": "plain_text", "content": "收起"},
+                "value": {"op": "stream_final_collapse"},
+            }
+        )
+        elements.append({"tag": "markdown", "content": content})
+        elements.append({"tag": "action", "actions": actions})
+    return (
+        {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "body": {"elements": elements},
+        },
+        True,
+    )
+
+
+def _set_final_stream_card_state(message_id: str, text: str, expanded: bool = False, page_index: int = 0) -> None:
+    mid = str(message_id or "").strip()
+    if not mid:
+        return
+    with _FINAL_STREAM_CARD_STATE_LOCK:
+        _FINAL_STREAM_CARD_STATE[mid] = {
+            "text": str(text or ""),
+            "expanded": bool(expanded),
+            "page_index": max(0, int(page_index or 0)),
+            "updated_at": time.time(),
+        }
+        if len(_FINAL_STREAM_CARD_STATE) > 500:
+            stale = sorted(_FINAL_STREAM_CARD_STATE.items(), key=lambda item: float(item[1].get("updated_at") or 0.0))
+            for old_mid, _ in stale[:-300]:
+                _FINAL_STREAM_CARD_STATE.pop(old_mid, None)
+
+
+def _get_final_stream_card_state(message_id: str) -> Dict[str, Any]:
+    mid = str(message_id or "").strip()
+    if not mid:
+        return {}
+    with _FINAL_STREAM_CARD_STATE_LOCK:
+        data = dict(_FINAL_STREAM_CARD_STATE.get(mid) or {})
+    return data
+
+
+def _clear_final_stream_card_state(message_id: str) -> None:
+    mid = str(message_id or "").strip()
+    if not mid:
+        return
+    with _FINAL_STREAM_CARD_STATE_LOCK:
+        _FINAL_STREAM_CARD_STATE.pop(mid, None)
 
 
 def _truncate_summary(text: str, max_len: int = 50) -> str:
@@ -661,6 +783,24 @@ class FeishuClient:
         if data.get("code") != 0:
             raise RuntimeError(f"send_card feishu err: {data}")
 
+    def update_message_card(self, message_id: str, card: Dict[str, Any]) -> None:
+        mid = str(message_id or "").strip()
+        if not mid:
+            raise RuntimeError("message_id is empty")
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}"
+        payload = {
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        }
+        resp = requests.patch(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"update_message_card failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"update_message_card feishu err: {data}")
+
     def upload_file(self, file_path: str, file_name: str = "") -> str:
         path = Path(str(file_path or "")).expanduser().resolve()
         if not path.exists() or (not path.is_file()):
@@ -808,9 +948,23 @@ class FeishuStreamingCardSession:
             if self.closed:
                 return
             final_merged = _merge_streaming_text(self.current_text, final_text)
+            replaced_message = False
             if final_merged and final_merged != self.current_text:
-                self._update_content(_final_stream_card_text(final_merged))
                 self.current_text = final_merged
+                final_card, is_long = _build_final_stream_card(final_merged, expanded=False, page_index=0)
+                if is_long and self.message_id:
+                    try:
+                        self.feishu.update_message_card(self.message_id, final_card)
+                        _set_final_stream_card_state(self.message_id, final_merged, expanded=False, page_index=0)
+                        replaced_message = True
+                    except Exception as exc:
+                        LOG.warning("final stream message replace failed message_id=%s err=%s", self.message_id or "<none>", exc)
+                        _clear_final_stream_card_state(self.message_id)
+                if not replaced_message:
+                    self._update_content(_final_stream_card_text(final_merged))
+                    _clear_final_stream_card_state(self.message_id)
+            else:
+                _clear_final_stream_card_state(self.message_id)
             self.sequence += 1
             token = self.feishu._tenant_access_token()
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
@@ -2081,15 +2235,56 @@ class AppServerBotBridge:
             return
 
         self._bind_user_chat({"open_id": open_id, "user_id": user_id, "union_id": union_id}, chat_id)
+        if op in FINAL_STREAM_CARD_ACTIONS:
+            value = dict(value)
+            value["_source_message_id"] = source_message_id
         self._run_card_action(chat_id=chat_id, op=op, value=value)
-        if CARD_AUTO_DELETE_ON_ACTION and source_message_id:
+        if CARD_AUTO_DELETE_ON_ACTION and source_message_id and op not in FINAL_STREAM_CARD_ACTIONS:
             try:
                 self.feishu.delete_message(source_message_id)
             except Exception as exc:
                 LOG.warning("delete card message failed message_id=%s op=%s err=%s", source_message_id, op, exc)
 
+    def _update_final_stream_message(self, message_id: str, expanded: bool, page_delta: int = 0) -> bool:
+        state = _get_final_stream_card_state(message_id)
+        if not state:
+            return False
+        text = str(state.get("text") or "")
+        pages = _text_to_card_chunks(text, max_len=FINAL_STREAM_CARD_PAGE_LEN)
+        total = max(1, len(pages))
+        page_index = max(0, min(total - 1, int(state.get("page_index") or 0) + int(page_delta or 0)))
+        card, is_long = _build_final_stream_card(text, expanded=expanded, page_index=page_index)
+        if not is_long:
+            _clear_final_stream_card_state(message_id)
+            return False
+        self.feishu.update_message_card(message_id, card)
+        _set_final_stream_card_state(message_id, text, expanded=expanded, page_index=page_index)
+        return True
+
     def _run_card_action(self, chat_id: str, op: str, value: Dict[str, Any]) -> None:
         LOG.info("card action: op=%s chat_id=%s value=%s", op, chat_id, value)
+
+        if op in FINAL_STREAM_CARD_ACTIONS:
+            source_message_id = str(value.get("_source_message_id") or "").strip()
+            if not source_message_id:
+                self.feishu.send_text(chat_id, "未找到可更新的结果卡片。")
+                return
+            try:
+                if op == "stream_final_expand":
+                    ok = self._update_final_stream_message(source_message_id, expanded=True, page_delta=0)
+                elif op == "stream_final_collapse":
+                    ok = self._update_final_stream_message(source_message_id, expanded=False, page_delta=0)
+                elif op == "stream_final_prev":
+                    ok = self._update_final_stream_message(source_message_id, expanded=True, page_delta=-1)
+                else:
+                    ok = self._update_final_stream_message(source_message_id, expanded=True, page_delta=1)
+            except Exception as exc:
+                LOG.warning("final stream card action failed message_id=%s op=%s err=%s", source_message_id, op, exc)
+                self.feishu.send_text(chat_id, f"更新结果卡失败: {exc}")
+                return
+            if not ok:
+                self.feishu.send_text(chat_id, "这条结果当前不支持展开，完整内容可到历史页查看。")
+            return
 
         if op == "open_project_manage":
             self.feishu.send_card(chat_id, self._build_project_manage_card(chat_id))
