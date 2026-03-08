@@ -300,12 +300,16 @@ def _merge_streaming_text(previous_text: str, next_text: str) -> str:
     return nxt
 
 
-def _final_stream_card_text(text: str, max_chunk_len: int = 3500) -> str:
+def _final_stream_card_text(text: str, max_chunk_len: int = 900) -> str:
     raw = str(text or "").strip()
-    chunks = _text_to_card_chunks(raw, max_len=max_chunk_len)
-    if len(chunks) <= 1:
+    if len(raw) <= max_chunk_len:
         return raw
-    return f"{chunks[0]}\n\n---\n内容较长，卡片先显示第 1/{len(chunks)} 段。完整内容可在历史页查看。"
+    chunks = _text_to_card_chunks(raw, max_len=max_chunk_len)
+    total = max(2, len(chunks))
+    footer = f"\n\n---\n内容较长，卡片先显示第 1/{total} 段。完整内容可在历史页查看。"
+    preview_limit = max(120, max_chunk_len - len(footer))
+    preview = _trim(raw, preview_limit).rstrip()
+    return f"{preview}{footer}"
 
 
 def _truncate_summary(text: str, max_len: int = 50) -> str:
