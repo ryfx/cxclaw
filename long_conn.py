@@ -312,15 +312,7 @@ def _merge_streaming_text(previous_text: str, next_text: str) -> str:
 
 
 def _final_stream_card_text(text: str, max_chunk_len: int = FINAL_STREAM_CARD_PREVIEW_LEN) -> str:
-    raw = str(text or "").strip()
-    if len(raw) <= max_chunk_len:
-        return raw
-    chunks = _text_to_card_chunks(raw, max_len=max_chunk_len)
-    total = max(2, len(chunks))
-    footer = f"\n\n---\n内容较长，卡片先显示第 1/{total} 段。完整内容可在历史页查看。"
-    preview_limit = max(120, max_chunk_len - len(footer))
-    preview = _trim(raw, preview_limit).rstrip()
-    return f"{preview}{footer}"
+    return str(text or "").strip()
 
 
 def _build_final_stream_card(text: str, expanded: bool = False, page_index: int = 0) -> Tuple[Dict[str, Any], bool]:
@@ -948,23 +940,10 @@ class FeishuStreamingCardSession:
             if self.closed:
                 return
             final_merged = _merge_streaming_text(self.current_text, final_text)
-            replaced_message = False
             if final_merged and final_merged != self.current_text:
                 self.current_text = final_merged
-                final_card, is_long = _build_final_stream_card(final_merged, expanded=False, page_index=0)
-                if is_long and self.message_id:
-                    try:
-                        self.feishu.update_message_card(self.message_id, final_card)
-                        _set_final_stream_card_state(self.message_id, final_merged, expanded=False, page_index=0)
-                        replaced_message = True
-                    except Exception as exc:
-                        LOG.warning("final stream message replace failed message_id=%s err=%s", self.message_id or "<none>", exc)
-                        _clear_final_stream_card_state(self.message_id)
-                if not replaced_message:
-                    self._update_content(_final_stream_card_text(final_merged))
-                    _clear_final_stream_card_state(self.message_id)
-            else:
-                _clear_final_stream_card_state(self.message_id)
+                self._update_content(_final_stream_card_text(final_merged))
+            _clear_final_stream_card_state(self.message_id)
             self.sequence += 1
             token = self.feishu._tenant_access_token()
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
