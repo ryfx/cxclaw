@@ -315,6 +315,19 @@ def _final_stream_card_text(text: str, max_chunk_len: int = FINAL_STREAM_CARD_PR
     return str(text or "").strip()
 
 
+def _with_project_prefix(text: str, project_name: str) -> str:
+    raw = str(text or "").strip()
+    project = str(project_name or "").strip()
+    if not project:
+        return raw
+    prefix = f"[{project}]"
+    if raw.startswith(prefix):
+        return raw
+    if raw:
+        return f"{prefix}\n\n{raw}"
+    return prefix
+
+
 def _build_final_stream_card(text: str, expanded: bool = False, page_index: int = 0) -> Tuple[Dict[str, Any], bool]:
     raw = str(text or "").strip()
     if not raw:
@@ -854,10 +867,11 @@ class FeishuClient:
 
 
 class FeishuStreamingCardSession:
-    def __init__(self, feishu: FeishuClient, chat_id: str, reply_to_message_id: str = "") -> None:
+    def __init__(self, feishu: FeishuClient, chat_id: str, reply_to_message_id: str = "", project_name: str = "") -> None:
         self.feishu = feishu
         self.chat_id = str(chat_id or "").strip()
         self.reply_to_message_id = str(reply_to_message_id or "").strip()
+        self.project_name = str(project_name or "").strip()
         self.card_id = ""
         self.message_id = ""
         self.sequence = 0
@@ -881,7 +895,7 @@ class FeishuStreamingCardSession:
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": "正在处理你的请求\n\n稍后会把进展显示在这里。",
+                        "content": _with_project_prefix("正在处理你的请求\n\n稍后会把进展显示在这里。", self.project_name),
                         "element_id": "content",
                     },
                 ]
@@ -944,7 +958,7 @@ class FeishuStreamingCardSession:
             if final_merged and final_merged != self.current_text:
                 self.current_text = final_merged
                 try:
-                    self._update_content(_final_stream_card_text(final_merged))
+                    self._update_content(_with_project_prefix(_final_stream_card_text(final_merged), self.project_name))
                 except Exception as exc:
                     update_err = exc
                     LOG.warning("stream card final content update failed card_id=%s err=%s", self.card_id or "<none>", exc)
@@ -1735,6 +1749,7 @@ class AppServerBotBridge:
 
     def _progress_ping_text(self, runtime_key: str, started_at: float) -> str:
         data = self._status_data(runtime_key)
+        project_name = str(data.get("project") or "").strip()
         progress = data.get("turn_progress") if isinstance(data.get("turn_progress"), dict) else {}
         turn_events = data.get("turn_events") if isinstance(data.get("turn_events"), list) else []
         elapsed = max(
@@ -1765,7 +1780,7 @@ class AppServerBotBridge:
             lines.extend([f"- {item}" for item in recent_events])
         if silent_for >= 30:
             lines.extend(["", f"最近 {_format_elapsed_human(silent_for)} 没有新的文字输出，可能正在读取文件或执行命令。"])
-        return "\n".join(lines)
+        return _with_project_prefix("\n".join(lines), project_name)
 
     def _progress_ping_loop(
         self,
@@ -2094,6 +2109,7 @@ class AppServerBotBridge:
                             self.feishu,
                             chat_id=chat_id,
                             reply_to_message_id=str(message_id or ""),
+                            project_name=active_project,
                         )
                         streaming_card.start()
                     except Exception as exc:
