@@ -36,7 +36,9 @@ FEISHU_APP_SECRET = _env("FEISHU_APP_SECRET")
 STATE_PATH = _env("BRIDGE_STATE_PATH", "")
 DEFAULT_CHAT_ID = _env("BRIDGE_MCP_DEFAULT_CHAT_ID", _env("BRIDGE_DEFAULT_CHAT_ID", ""))
 DEFAULT_PROJECT = _env("BRIDGE_MCP_DEFAULT_PROJECT", "")
+DEFAULT_RUNTIME_ID = _env("BRIDGE_MCP_RUNTIME_ID", "")
 DEFAULT_RUNTIME_CWD = _env("BRIDGE_MCP_RUNTIME_CWD", "")
+REPLY_CONTEXT_PATH = _env("BRIDGE_MCP_REPLY_CONTEXT_PATH", "")
 ALLOWED_DIRS_RAW = _env("BRIDGE_MCP_FILE_ALLOWED_DIRS", "")
 FILE_MAX_SIZE_MB = min(
     FEISHU_FILE_UPLOAD_MAX_SIZE_MB,
@@ -53,6 +55,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "path": {"type": "string"},
                 "display_name": {"type": "string"},
                 "chat_id": {"type": "string"},
+                "reply_to_message_id": {"type": "string"},
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -66,6 +69,7 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "paths": {"type": "array", "items": {"type": "string"}},
                 "chat_id": {"type": "string"},
+                "reply_to_message_id": {"type": "string"},
             },
             "required": ["paths"],
             "additionalProperties": False,
@@ -106,6 +110,25 @@ def _latest_chat_id_from_state() -> str:
     return best_chat
 
 
+def _load_reply_context() -> Dict[str, Dict[str, Any]]:
+    path = Path(REPLY_CONTEXT_PATH)
+    if not REPLY_CONTEXT_PATH or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    runtimes = data.get("runtimes") if isinstance(data, dict) else {}
+    if not isinstance(runtimes, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for runtime_id, item in runtimes.items():
+        key = str(runtime_id or "").strip()
+        if key and isinstance(item, dict):
+            out[key] = dict(item)
+    return out
+
+
 def _resolve_chat_id(given_chat_id: str = "") -> str:
     cid = str(given_chat_id or "").strip()
     if cid:
@@ -113,6 +136,22 @@ def _resolve_chat_id(given_chat_id: str = "") -> str:
     if DEFAULT_CHAT_ID:
         return DEFAULT_CHAT_ID
     return _latest_chat_id_from_state()
+
+
+def _resolve_reply_to_message_id(given_message_id: str = "", target_chat_id: str = "") -> str:
+    mid = str(given_message_id or "").strip()
+    if mid:
+        return mid
+    runtime_id = str(DEFAULT_RUNTIME_ID or "").strip()
+    if not runtime_id:
+        return ""
+    context = _load_reply_context().get(runtime_id)
+    if not isinstance(context, dict):
+        return ""
+    context_chat_id = str(context.get("chat_id") or "").strip()
+    if target_chat_id and context_chat_id and context_chat_id != str(target_chat_id or "").strip():
+        return ""
+    return str(context.get("message_id") or "").strip()
 
 
 def _allowed_roots() -> List[Path]:
@@ -178,7 +217,7 @@ def _tenant_access_token() -> str:
     return token
 
 
-def _send_file_to_chat(chat_id: str, file_path: Path, display_name: str = "") -> Dict[str, Any]:
+def _send_file(chat_id: str, file_path: Path, display_name: str = "", reply_to_message_id: str = "") -> Dict[str, Any]:
     token = _tenant_access_token()
     with file_path.open("rb") as handle:
         upload_resp = requests.post(
@@ -197,24 +236,55 @@ def _send_file_to_chat(chat_id: str, file_path: Path, display_name: str = "") ->
     if not file_key:
         raise RuntimeError(f"upload_file missing file_key: {upload_data}")
 
+    reply_mid = str(reply_to_message_id or "").strip()
+    send_url = f"{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"
+    send_json: Dict[str, Any] = {
+        "receive_id": str(chat_id or ""),
+        "msg_type": "file",
+        "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
+    }
+    delivery_mode = "chat"
+    if reply_mid:
+        send_url = f"{FEISHU_API}/im/v1/messages/{reply_mid}/reply"
+        send_json = {"msg_type": "file", "content": json.dumps({"file_key": file_key}, ensure_ascii=False)}
+        delivery_mode = "reply"
+
     send_resp = requests.post(
-        f"{FEISHU_API}/im/v1/messages?receive_id_type=chat_id",
+        send_url,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={
-            "receive_id": str(chat_id or ""),
-            "msg_type": "file",
-            "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
-        },
+        json=send_json,
         timeout=20,
     )
+    send_data: Dict[str, Any] = {}
+    if send_resp.status_code < 300:
+        try:
+            send_data = send_resp.json()
+        except Exception:
+            send_data = {}
+    if (send_resp.status_code >= 300 or send_data.get("code") != 0) and delivery_mode == "reply":
+        send_resp = requests.post(
+            f"{FEISHU_API}/im/v1/messages?receive_id_type=chat_id",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "receive_id": str(chat_id or ""),
+                "msg_type": "file",
+                "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
+            },
+            timeout=20,
+        )
+        delivery_mode = "chat_fallback"
+        send_data = {}
     if send_resp.status_code >= 300:
         raise RuntimeError(f"send_file failed status={send_resp.status_code} body={send_resp.text}")
-    send_data = send_resp.json()
+    if not send_data:
+        send_data = send_resp.json()
     if send_data.get("code") != 0:
         raise RuntimeError(f"send_file feishu err: {send_data}")
     return {
         "name": str(display_name or file_path.name),
         "path": str(file_path),
+        "delivery_mode": delivery_mode,
+        "reply_to_message_id": reply_mid,
         "message_id": str((send_data.get("data") or {}).get("message_id") or "").strip(),
     }
 
@@ -223,21 +293,45 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     target_chat = _resolve_chat_id(str(args.get("chat_id") or ""))
     if not target_chat:
         return {"ok": False, "error": "cannot resolve target Feishu chat_id"}
+    reply_to_message_id = _resolve_reply_to_message_id(
+        str(args.get("reply_to_message_id") or ""),
+        target_chat_id=target_chat,
+    )
     if name == "feishu_send_file":
         path = _normalize_send_path(str(args.get("path") or ""))
-        item = _send_file_to_chat(
+        item = _send_file(
             chat_id=target_chat,
             file_path=path,
             display_name=str(args.get("display_name") or "").strip(),
+            reply_to_message_id=reply_to_message_id,
         )
-        return {"ok": True, "chat_id": target_chat, "project": DEFAULT_PROJECT, "sent": [item]}
+        return {
+            "ok": True,
+            "chat_id": target_chat,
+            "project": DEFAULT_PROJECT,
+            "reply_to_message_id": reply_to_message_id,
+            "sent": [item],
+        }
     if name == "feishu_send_files":
         raw_paths = args.get("paths") if isinstance(args.get("paths"), list) else []
         sent: List[Dict[str, Any]] = []
         for raw in raw_paths:
             path = _normalize_send_path(str(raw or ""))
-            sent.append(_send_file_to_chat(chat_id=target_chat, file_path=path, display_name=path.name))
-        return {"ok": True, "chat_id": target_chat, "project": DEFAULT_PROJECT, "sent": sent}
+            sent.append(
+                _send_file(
+                    chat_id=target_chat,
+                    file_path=path,
+                    display_name=path.name,
+                    reply_to_message_id=reply_to_message_id,
+                )
+            )
+        return {
+            "ok": True,
+            "chat_id": target_chat,
+            "project": DEFAULT_PROJECT,
+            "reply_to_message_id": reply_to_message_id,
+            "sent": sent,
+        }
     return {"ok": False, "error": f"unknown tool: {name}"}
 
 

@@ -78,6 +78,9 @@ DEFAULT_CODEX_HOME = _resolve_env_path(os.environ.get("BRIDGE_DEFAULT_CODEX_HOME
 BRIDGE_MCP_SERVER_NAME = str(os.environ.get("BRIDGE_MCP_SERVER_NAME", "feishu-bridge-files")).strip() or "feishu-bridge-files"
 BRIDGE_MCP_SERVER_PATH = _resolve_env_path(os.environ.get("BRIDGE_MCP_SERVER_PATH", str(APP_DIR / "bridge_mcp_server.py")))
 BRIDGE_MCP_PYTHON = str(Path(os.environ.get("BRIDGE_MCP_PYTHON", sys.executable)).expanduser())
+BRIDGE_MCP_REPLY_CONTEXT_PATH = _resolve_env_path(
+    os.environ.get("BRIDGE_MCP_REPLY_CONTEXT_PATH", str(DATA_DIR / "reply_context.json"))
+)
 PROJECTS_STORE_PATH = _resolve_env_path(os.environ.get("BRIDGE_PROJECTS_STORE_PATH", str(DATA_DIR / "projects.json")))
 HISTORY_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_PATH", str(DATA_DIR / "history.json")))
 HISTORY_DB_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_DB_PATH", str(DATA_DIR / "history.db")))
@@ -685,9 +688,11 @@ def _ensure_bridge_mcp_server_for_known_homes() -> None:
 
 def _apply_runtime_bridge_env(runtime: ChatRuntime) -> None:
     runtime.client.env["BRIDGE_STATE_PATH"] = str(_state_path.resolve())
+    runtime.client.env["BRIDGE_MCP_RUNTIME_ID"] = str(runtime.chat_id or "")
     runtime.client.env["BRIDGE_MCP_DEFAULT_CHAT_ID"] = _runtime_actual_chat_id(runtime.chat_id)
     runtime.client.env["BRIDGE_MCP_DEFAULT_PROJECT"] = _runtime_project_name(runtime.chat_id)
     runtime.client.env["BRIDGE_MCP_RUNTIME_CWD"] = str(Path(runtime.cwd or DEFAULT_CWD).expanduser().resolve())
+    runtime.client.env["BRIDGE_MCP_REPLY_CONTEXT_PATH"] = str(BRIDGE_MCP_REPLY_CONTEXT_PATH)
 
 
 def _decode_jwt_payload(token: str) -> Dict[str, Any]:

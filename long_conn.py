@@ -67,6 +67,10 @@ USER_CHAT_MAP_PATH = Path(os.getenv("BRIDGE_USER_CHAT_MAP_PATH", str(APP_DIR / "
 if not USER_CHAT_MAP_PATH.is_absolute():
     USER_CHAT_MAP_PATH = APP_DIR / USER_CHAT_MAP_PATH
 USER_CHAT_MAP_PATH = USER_CHAT_MAP_PATH.resolve()
+REPLY_CONTEXT_PATH = Path(os.getenv("BRIDGE_MCP_REPLY_CONTEXT_PATH", str(APP_DIR / "data" / "reply_context.json"))).expanduser()
+if not REPLY_CONTEXT_PATH.is_absolute():
+    REPLY_CONTEXT_PATH = APP_DIR / REPLY_CONTEXT_PATH
+REPLY_CONTEXT_PATH = REPLY_CONTEXT_PATH.resolve()
 CARD_AUTO_DELETE_ON_ACTION = str(os.getenv("BRIDGE_CARD_AUTO_DELETE_ON_ACTION", "true")).strip().lower() in {
     "1",
     "true",
@@ -124,6 +128,7 @@ FINAL_STREAM_CARD_ACTIONS = {
 
 _FINAL_STREAM_CARD_STATE_LOCK = threading.Lock()
 _FINAL_STREAM_CARD_STATE: Dict[str, Dict[str, Any]] = {}
+_REPLY_CONTEXT_FILE_LOCK = threading.Lock()
 
 
 def _safe_str(value: Any) -> str:
@@ -206,6 +211,64 @@ def _parse_json_map(raw: str, default_map: Dict[str, str]) -> Dict[str, str]:
         if kk and vv:
             out[kk] = vv
     return out
+
+
+def _load_reply_context_map() -> Dict[str, Dict[str, Any]]:
+    if not REPLY_CONTEXT_PATH.exists():
+        return {}
+    try:
+        data = json.loads(REPLY_CONTEXT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    runtimes = data.get("runtimes") if isinstance(data, dict) else {}
+    if not isinstance(runtimes, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for runtime_id, item in runtimes.items():
+        key = str(runtime_id or "").strip()
+        if key and isinstance(item, dict):
+            out[key] = dict(item)
+    return out
+
+
+def _write_reply_context_map(runtimes: Dict[str, Dict[str, Any]]) -> None:
+    REPLY_CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"runtimes": runtimes, "updated_at": int(time.time())}
+    REPLY_CONTEXT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _set_runtime_reply_context(runtime_id: str, chat_id: str, message_id: str, project_name: str = "") -> None:
+    rid = str(runtime_id or "").strip()
+    mid = str(message_id or "").strip()
+    if not rid or not mid:
+        return
+    with _REPLY_CONTEXT_FILE_LOCK:
+        runtimes = _load_reply_context_map()
+        runtimes[rid] = {
+            "runtime_id": rid,
+            "chat_id": str(chat_id or "").strip(),
+            "message_id": mid,
+            "project": str(project_name or "").strip(),
+            "updated_at": int(time.time()),
+        }
+        _write_reply_context_map(runtimes)
+
+
+def _clear_runtime_reply_context(runtime_id: str, message_id: str = "") -> None:
+    rid = str(runtime_id or "").strip()
+    expected_mid = str(message_id or "").strip()
+    if not rid:
+        return
+    with _REPLY_CONTEXT_FILE_LOCK:
+        runtimes = _load_reply_context_map()
+        current = runtimes.get(rid) if isinstance(runtimes.get(rid), dict) else None
+        if not current:
+            return
+        current_mid = str(current.get("message_id") or "").strip()
+        if expected_mid and current_mid and current_mid != expected_mid:
+            return
+        runtimes.pop(rid, None)
+        _write_reply_context_map(runtimes)
 
 
 def _sanitize_filename(raw: str, fallback: str) -> str:
@@ -2107,6 +2170,13 @@ class AppServerBotBridge:
             try:
                 start = time.time()
                 LOG.info("turn start runtime_key=%s message_id=%s", runtime_key, message_id or "<none>")
+                if str(message_id or "").strip():
+                    _set_runtime_reply_context(
+                        runtime_key,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project_name=active_project,
+                    )
                 if STREAMING_CARD_ENABLED and str(message_id or "").strip():
                     try:
                         streaming_card = FeishuStreamingCardSession(
@@ -2166,6 +2236,8 @@ class AppServerBotBridge:
             progress_stop.set()
             if progress_thread and progress_thread.is_alive():
                 progress_thread.join(timeout=0.5)
+            if str(message_id or "").strip():
+                _clear_runtime_reply_context(runtime_key, message_id=str(message_id or ""))
             if typing_reaction_id and str(message_id or "").strip():
                 try:
                     self.feishu.delete_typing_reaction(str(message_id), typing_reaction_id)
