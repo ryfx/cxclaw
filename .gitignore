@@ -4,6 +4,7 @@ __pycache__/
 
 # Virtualenv
 .venv/
+node_modules/
 
 # Local env and runtime data
 .env
