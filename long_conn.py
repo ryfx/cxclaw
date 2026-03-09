@@ -1790,14 +1790,18 @@ class AppServerBotBridge:
         stop_event: threading.Event,
         streaming_card: Optional[FeishuStreamingCardSession],
     ) -> None:
-        interval_sec = STREAMING_CARD_UPDATE_INTERVAL_SEC if (streaming_card and streaming_card.is_active()) else PROGRESS_PING_INTERVAL_SEC
+        has_streaming_card = streaming_card is not None
+        interval_sec = STREAMING_CARD_UPDATE_INTERVAL_SEC if has_streaming_card else PROGRESS_PING_INTERVAL_SEC
         while not stop_event.wait(interval_sec):
             try:
                 text = self._progress_ping_text(runtime_key=runtime_key, started_at=started_at)
-                if streaming_card and streaming_card.is_active():
-                    streaming_card.update(text)
-                else:
-                    self.feishu.send_text(reply_chat_id, text)
+                if stop_event.is_set():
+                    return
+                if has_streaming_card:
+                    if streaming_card and streaming_card.is_active():
+                        streaming_card.update(text)
+                    continue
+                self.feishu.send_text(reply_chat_id, text)
             except Exception as exc:
                 LOG.warning("progress ping failed runtime_key=%s err=%s", runtime_key, exc)
 
