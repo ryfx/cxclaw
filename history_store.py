@@ -17,6 +17,26 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _preview_text(value: Any, max_len: int = 120) -> str:
+    raw = " ".join(str(value or "").split()).strip()
+    if len(raw) <= max_len:
+        return raw
+    return raw[: max_len - 3].rstrip() + "..."
+
+
+def _session_display_title(user_text: str, assistant_text: str, error_text: str) -> str:
+    user_preview = _preview_text(user_text, max_len=48)
+    if user_preview:
+        return user_preview
+    error_preview = _preview_text(error_text, max_len=48)
+    if error_preview:
+        return error_preview
+    assistant_preview = _preview_text(assistant_text, max_len=48)
+    if assistant_preview:
+        return assistant_preview
+    return "未命名会话"
+
+
 class BridgeHistoryStore:
     def __init__(self, db_path: str, max_turns: int = 2000, legacy_json_path: Optional[str] = None):
         self.db_path = Path(db_path)
@@ -118,9 +138,6 @@ class BridgeHistoryStore:
                 SELECT
                     project,
                     chat_id,
-                    MAX(cwd) AS cwd,
-                    MAX(model) AS model,
-                    MAX(auth_profile) AS auth_profile,
                     MIN(CASE
                         WHEN started_at > 0 THEN started_at
                         WHEN ended_at > 0 THEN ended_at
@@ -140,19 +157,54 @@ class BridgeHistoryStore:
                 """,
                 (target_project, target_project, safe_limit, safe_offset),
             ).fetchall()
-        items = [
-            {
-                "project": str(row["project"] or "未命名项目"),
-                "chat_id": str(row["chat_id"] or ""),
-                "cwd": str(row["cwd"] or ""),
-                "model": str(row["model"] or ""),
-                "auth_profile": str(row["auth_profile"] or "") or "default",
-                "started_at": _safe_int(row["started_at"]),
-                "updated_at": _safe_int(row["updated_at"]),
-                "turn_count": _safe_int(row["turn_count"]),
-            }
-            for row in rows
-        ]
+            items: List[Dict[str, Any]] = []
+            for row in rows:
+                item = {
+                    "project": str(row["project"] or "未命名项目"),
+                    "chat_id": str(row["chat_id"] or ""),
+                    "cwd": "",
+                    "model": "",
+                    "auth_profile": "default",
+                    "started_at": _safe_int(row["started_at"]),
+                    "updated_at": _safe_int(row["updated_at"]),
+                    "turn_count": _safe_int(row["turn_count"]),
+                }
+                latest = conn.execute(
+                    """
+                    SELECT turn_id, status, started_at, ended_at, updated_at, cwd, model, auth_profile, user_text, assistant_text, error_text
+                    FROM turns
+                    WHERE project = ? AND chat_id = ?
+                    ORDER BY COALESCE(NULLIF(ended_at, 0), updated_at, started_at) DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (item["project"], item["chat_id"]),
+                ).fetchone()
+                latest_user_text = str((latest["user_text"] if latest else "") or "")
+                latest_assistant_text = str((latest["assistant_text"] if latest else "") or "")
+                latest_error_text = str((latest["error_text"] if latest else "") or "")
+                item.update(
+                    {
+                        "cwd": str((latest["cwd"] if latest else "") or ""),
+                        "model": str((latest["model"] if latest else "") or ""),
+                        "auth_profile": str((latest["auth_profile"] if latest else "") or "") or "default",
+                        "latest_turn_id": str((latest["turn_id"] if latest else "") or ""),
+                        "latest_status": str((latest["status"] if latest else "") or ""),
+                        "latest_started_at": _safe_int(latest["started_at"] if latest else 0),
+                        "latest_ended_at": _safe_int(latest["ended_at"] if latest else 0),
+                        "latest_updated_at": _safe_int(latest["updated_at"] if latest else 0),
+                        "latest_user_text": latest_user_text,
+                        "latest_user_preview": _preview_text(latest_user_text, max_len=72),
+                        "latest_assistant_preview": _preview_text(latest_assistant_text, max_len=120),
+                        "latest_error_preview": _preview_text(latest_error_text, max_len=120),
+                        "display_title": _session_display_title(
+                            latest_user_text,
+                            latest_assistant_text,
+                            latest_error_text,
+                        ),
+                        "display_preview": _preview_text(latest_assistant_text or latest_error_text, max_len=120),
+                    }
+                )
+                items.append(item)
         return {"items": items, "pagination": self._pagination(safe_offset, safe_limit, total)}
 
     def turn_items(
