@@ -111,11 +111,11 @@ FEISHU_OAUTH_USERINFO_URL = str(
 ).strip()
 MCP_TOOL_HINT_BEGIN = "<bridge_mcp_tool_hint>"
 MCP_TOOL_HINT_END = "</bridge_mcp_tool_hint>"
-MCP_FILE_TOOL_HINT = (
+MCP_FILE_TOOL_HINT_BASE = (
     "MCP tools available in this environment: feishu_send_file and feishu_send_files. "
     "Use them when the user wants a local file sent back to Feishu. "
     "Do not decide MCP availability from resources or resource templates, because this bridge exposes tools only. "
-    "If file delivery is requested, prefer calling the tool explicitly instead of only mentioning file paths."
+    "If file delivery is requested, call the tool explicitly instead of only mentioning file paths."
 )
 
 
@@ -503,15 +503,6 @@ def _project_label_for_cwd(cwd: str) -> str:
     return "未命名项目"
 
 
-def _inject_mcp_tool_hint(text: str) -> str:
-    raw = str(text or "")
-    if not BRIDGE_MCP_TOOL_HINT_ENABLED:
-        return raw
-    if MCP_TOOL_HINT_BEGIN in raw:
-        return raw
-    return f"{MCP_TOOL_HINT_BEGIN}\n{MCP_FILE_TOOL_HINT}\n{MCP_TOOL_HINT_END}\n\n{raw}".strip()
-
-
 def _strip_mcp_tool_hint(text: str) -> str:
     raw = str(text or "")
     if MCP_TOOL_HINT_BEGIN not in raw:
@@ -521,6 +512,52 @@ def _strip_mcp_tool_hint(text: str) -> str:
         re.S,
     )
     return pattern.sub("", raw, count=1).strip()
+
+
+def _load_reply_context_map() -> Dict[str, Dict[str, Any]]:
+    if not BRIDGE_MCP_REPLY_CONTEXT_PATH.exists():
+        return {}
+    try:
+        data = json.loads(BRIDGE_MCP_REPLY_CONTEXT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    runtimes = data.get("runtimes") if isinstance(data, dict) else {}
+    if not isinstance(runtimes, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for runtime_id, item in runtimes.items():
+        key = str(runtime_id or "").strip()
+        if key and isinstance(item, dict):
+            out[key] = dict(item)
+    return out
+
+
+def _reply_anchor_for_runtime(runtime_id: str) -> Dict[str, str]:
+    item = _load_reply_context_map().get(str(runtime_id or "").strip())
+    if not isinstance(item, dict):
+        return {"chat_id": "", "reply_to_message_id": ""}
+    return {
+        "chat_id": str(item.get("chat_id") or "").strip(),
+        "reply_to_message_id": str(item.get("message_id") or "").strip(),
+    }
+
+
+def _inject_runtime_mcp_tool_hint(text: str, runtime_id: str) -> str:
+    raw = _strip_mcp_tool_hint(text)
+    if not BRIDGE_MCP_TOOL_HINT_ENABLED:
+        return raw
+    actual_chat_id = _runtime_actual_chat_id(runtime_id)
+    anchor = _reply_anchor_for_runtime(runtime_id)
+    reply_to_message_id = str(anchor.get("reply_to_message_id") or "").strip()
+    hint_lines = [MCP_FILE_TOOL_HINT_BASE]
+    if actual_chat_id:
+        hint_lines.append(f"For this turn, pass chat_id=\"{actual_chat_id}\" when calling the file tool.")
+    if reply_to_message_id:
+        hint_lines.append(
+            f"For this turn, pass reply_to_message_id=\"{reply_to_message_id}\" so the file replies to the trigger message."
+        )
+    hint = " ".join(hint_lines).strip()
+    return f"{MCP_TOOL_HINT_BEGIN}\n{hint}\n{MCP_TOOL_HINT_END}\n\n{raw}".strip()
 
 
 def _runtime_actual_chat_id(runtime_id: str) -> str:
@@ -1161,7 +1198,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     turn_model = ""
     turn_auth_profile = ""
     visible_user_text = _strip_mcp_tool_hint(body.text)
-    turn_input_text = _inject_mcp_tool_hint(body.text)
+    turn_input_text = _inject_runtime_mcp_tool_hint(body.text, chat_id)
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
@@ -1370,7 +1407,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
 def chat_turn_steer(chat_id: str, body: SteerTurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     visible_user_text = _strip_mcp_tool_hint(body.text)
-    steer_input_text = _inject_mcp_tool_hint(body.text)
+    steer_input_text = _inject_runtime_mcp_tool_hint(body.text, chat_id)
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         try:
