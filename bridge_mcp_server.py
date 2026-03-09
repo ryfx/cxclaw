@@ -17,14 +17,15 @@ SERVER_NAME = "feishu-bridge-files"
 SERVER_VERSION = "0.1.0"
 FEISHU_API = "https://open.feishu.cn/open-apis"
 FEISHU_FILE_UPLOAD_MAX_SIZE_MB = 30
+DEFAULT_PROTOCOL_VERSION = "2025-03-26"
 
 
 def _env(name: str, default: str = "") -> str:
     return str(os.getenv(name, default) or "").strip()
 
 
-def _content_text(text: str, is_error: bool = False) -> Dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}], "isError": bool(is_error)}
+def _content_text(text: str) -> Dict[str, Any]:
+    return {"type": "text", "text": text}
 
 
 def _json_text(data: Any) -> str:
@@ -350,24 +351,28 @@ def _write_response(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def _handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_request(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     req_id = req.get("id")
     method = str(req.get("method") or "")
     params = req.get("params") if isinstance(req.get("params"), dict) else {}
 
     if method == "initialize":
+        protocol_version = str(params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION).strip() or DEFAULT_PROTOCOL_VERSION
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
+                "protocolVersion": protocol_version,
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "capabilities": {"tools": {"listChanged": False}},
             },
         }
     if method == "notifications/initialized":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+        return None
+    if method.startswith("notifications/"):
+        return None
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS, "nextCursor": None}}
     if method == "tools/call":
         name = str(params.get("name") or "")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
@@ -376,7 +381,7 @@ def _handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {"content": [_content_text(_json_text(out), is_error=is_error)], "isError": is_error},
+            "result": {"content": [_content_text(_json_text(out))], "isError": is_error},
         }
     return {
         "jsonrpc": "2.0",
@@ -395,7 +400,9 @@ def main() -> int:
         if req is None:
             return 0
         try:
-            _write_response(_handle_request(req))
+            response = _handle_request(req)
+            if response is not None:
+                _write_response(response)
         except Exception as exc:
             _write_response({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32000, "message": str(exc)}})
 
