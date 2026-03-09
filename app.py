@@ -169,6 +169,12 @@ class BridgeRuntimeManager:
                 return runtime
 
             persisted = STORE.get_chat(clean_chat_id)
+            if (not persisted) and ("::" in clean_chat_id):
+                legacy = STORE.get_chat(_runtime_actual_chat_id(clean_chat_id))
+                legacy_cwd = str(legacy.get("cwd") or "")
+                target_project = _runtime_project_name(clean_chat_id)
+                if legacy and (not target_project or _project_label_for_cwd(legacy_cwd) == target_project):
+                    persisted = dict(legacy)
             runtime = ChatRuntime(
                 chat_id=clean_chat_id,
                 thread_id=str(persisted.get("thread_id") or ""),
@@ -473,6 +479,20 @@ def _project_label_for_cwd(cwd: str) -> str:
     return "未命名项目"
 
 
+def _runtime_actual_chat_id(runtime_id: str) -> str:
+    raw = str(runtime_id or "").strip()
+    if "::" in raw:
+        return raw.split("::", 1)[0].strip()
+    return raw
+
+
+def _runtime_project_name(runtime_id: str) -> str:
+    raw = str(runtime_id or "").strip()
+    if "::" not in raw:
+        return ""
+    return raw.split("::", 1)[1].strip()
+
+
 def _build_turn_record(
     runtime: ChatRuntime,
     turn_id: str,
@@ -498,7 +518,8 @@ def _build_turn_record(
     return {
         "id": f"{end_ts}_{runtime.chat_id}_{turn_id or 'no_turn'}",
         "project": project,
-        "chat_id": runtime.chat_id,
+        "chat_id": _runtime_actual_chat_id(runtime.chat_id),
+        "runtime_id": runtime.chat_id,
         "thread_id": str(thread_id or runtime.thread_id or ""),
         "turn_id": str(turn_id or ""),
         "cwd": current_cwd,
@@ -529,6 +550,9 @@ def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
 
 def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     data: Dict[str, Any] = {
+        "runtime_id": runtime.chat_id,
+        "source_chat_id": _runtime_actual_chat_id(runtime.chat_id),
+        "project": _runtime_project_name(runtime.chat_id),
         "thread_id": runtime.thread_id,
         "active_turn_id": runtime.active_turn_id,
         "cwd": runtime.cwd,
@@ -842,6 +866,7 @@ def healthz() -> Dict[str, Any]:
 def chat_status(chat_id: str) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     persisted = STORE.get_chat(chat_id)
+    source_chat_id = _runtime_actual_chat_id(chat_id)
     thread_id = str(runtime.thread_id or persisted.get("thread_id") or "")
     thread_status: Dict[str, Any] = {}
     token_usage: Dict[str, Any] = {}
@@ -880,7 +905,9 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
     return {
         "ok": True,
         "data": {
-            "chat_id": chat_id,
+            "chat_id": source_chat_id,
+            "runtime_id": chat_id,
+            "project": _runtime_project_name(chat_id) or _project_label_for_cwd(str(runtime.cwd or persisted.get("cwd") or DEFAULT_CWD)),
             "thread_id": thread_id,
             "active_turn_id": active_turn_id,
             "thread_status": thread_status,

@@ -1105,6 +1105,8 @@ class AppServerBotBridge:
         self._user_chat_map: Dict[str, str] = {}
         self._await_project_name_lock = threading.Lock()
         self._await_project_name: Dict[str, bool] = {}
+        self._active_project_lock = threading.Lock()
+        self._active_project: Dict[str, str] = {}
 
         self._load_persisted_projects()
         self._load_persisted_user_chat_map()
@@ -1261,7 +1263,8 @@ class AppServerBotBridge:
         self._persist_projects()
 
         try:
-            self.control.reset(chat_id=chat_id, cwd=str(proj_path))
+            self._set_active_project(chat_id, name)
+            self.control.update_config(chat_id=self._runtime_key(chat_id, name), cwd=str(proj_path))
         except Exception as exc:
             return f"项目已{'创建' if created else '注册'}，但切换失败: {exc}\nname={name}\npath={proj_path}"
         return f"项目已{'创建' if created else '注册'}并切换成功。\nname={name}\npath={proj_path}"
@@ -1344,9 +1347,9 @@ class AppServerBotBridge:
                 self._queued_inputs.pop(str(chat_id), None)
             return nxt
 
-    def _drain_queued_inputs(self, chat_id: str) -> None:
+    def _drain_queued_inputs(self, queue_key: str, reply_chat_id: str) -> None:
         while True:
-            nxt = self._pop_next_queued_input(chat_id)
+            nxt = self._pop_next_queued_input(queue_key)
             if not nxt:
                 return
             text = str(nxt.get("text") or "").strip()
@@ -1354,13 +1357,13 @@ class AppServerBotBridge:
             if not text:
                 continue
             try:
-                answer = self._run_turn(chat_id=chat_id, text=text, image_paths=image_paths)
-                self.feishu.smart_send(chat_id, answer)
+                answer = self._run_turn(runtime_key=queue_key, text=text, image_paths=image_paths)
+                self.feishu.smart_send(reply_chat_id, answer)
             except Exception as exc:
-                self.feishu.send_text(chat_id, f"排队任务处理失败:\n{exc}")
+                self.feishu.send_text(reply_chat_id, f"排队任务处理失败:\n{exc}")
 
     def _format_pending_files_text(self, chat_id: str) -> str:
-        items = self._list_pending_files(chat_id)
+        items = self._list_pending_files(self._runtime_key(chat_id))
         if not items:
             return "当前没有暂存附件。"
         lines = [f"当前暂存附件 {len(items)} 个:"]
@@ -1573,8 +1576,64 @@ class AppServerBotBridge:
                 return name
         return ""
 
+    def _runtime_key(self, chat_id: str, project_name: str = "") -> str:
+        project = str(project_name or "").strip()
+        if "::" in str(chat_id or ""):
+            return str(chat_id or "").strip()
+        if not project:
+            project = self._ensure_active_project(chat_id)
+        return f"{str(chat_id or '').strip()}::{project}" if project else str(chat_id or "").strip()
+
+    def _get_active_project(self, chat_id: str) -> str:
+        with self._active_project_lock:
+            return str(self._active_project.get(str(chat_id or "")) or "").strip()
+
+    def _set_active_project(self, chat_id: str, project_name: str) -> None:
+        cid = str(chat_id or "").strip()
+        project = str(project_name or "").strip()
+        if not cid:
+            return
+        with self._active_project_lock:
+            if project:
+                self._active_project[cid] = project
+            else:
+                self._active_project.pop(cid, None)
+
+    def _ensure_active_project(self, chat_id: str) -> str:
+        active = self._get_active_project(chat_id)
+        if active:
+            return active
+        try:
+            legacy = self.control.status(str(chat_id or "")).get("data")
+        except Exception:
+            legacy = {}
+        if isinstance(legacy, dict):
+            inferred = self._current_project_name(str(legacy.get("cwd") or ""))
+            if inferred:
+                self._set_active_project(chat_id, inferred)
+                return inferred
+        with self._projects_lock:
+            first = next(iter(self.projects.keys()), "")
+        if first:
+            self._set_active_project(chat_id, first)
+        return first
+
+    def _ensure_project_runtime(self, chat_id: str, project_name: str) -> str:
+        project = str(project_name or "").strip()
+        cwd = str(self.projects.get(project) or "").strip()
+        runtime_key = self._runtime_key(chat_id, project)
+        if cwd:
+            self.control.update_config(runtime_key, cwd=cwd)
+        return runtime_key
+
     def _status_data(self, chat_id: str) -> Dict[str, Any]:
-        data = self.control.status(chat_id).get("data")
+        raw = str(chat_id or "").strip()
+        if "::" in raw:
+            runtime_key = raw
+        else:
+            active_project = self._ensure_active_project(raw)
+            runtime_key = self._ensure_project_runtime(raw, active_project) if active_project else raw
+        data = self.control.status(runtime_key).get("data")
         if isinstance(data, dict):
             return data
         return {}
@@ -1590,7 +1649,7 @@ class AppServerBotBridge:
         total_usage = token_usage.get("total") if isinstance(token_usage.get("total"), dict) else {}
         last_usage = token_usage.get("last") if isinstance(token_usage.get("last"), dict) else {}
         model_ctx = token_usage.get("modelContextWindow")
-        pending_count = len(self._list_pending_files(chat_id))
+        pending_count = len(self._list_pending_files(self._runtime_key(chat_id)))
         cwd = str(data.get("cwd") or "")
         proj = self._current_project_name(cwd)
         auto_switch_enabled = bool(data.get("auto_auth_switch_enabled"))
@@ -1655,8 +1714,8 @@ class AppServerBotBridge:
             + ("\n" + "\n".join(usage_lines) if usage_lines else "")
         )
 
-    def _progress_ping_text(self, chat_id: str, started_at: float) -> str:
-        data = self._status_data(chat_id)
+    def _progress_ping_text(self, runtime_key: str, started_at: float) -> str:
+        data = self._status_data(runtime_key)
         progress = data.get("turn_progress") if isinstance(data.get("turn_progress"), dict) else {}
         turn_events = data.get("turn_events") if isinstance(data.get("turn_events"), list) else []
         elapsed = max(
@@ -1691,7 +1750,8 @@ class AppServerBotBridge:
 
     def _progress_ping_loop(
         self,
-        chat_id: str,
+        runtime_key: str,
+        reply_chat_id: str,
         started_at: float,
         stop_event: threading.Event,
         streaming_card: Optional[FeishuStreamingCardSession],
@@ -1699,16 +1759,16 @@ class AppServerBotBridge:
         interval_sec = STREAMING_CARD_UPDATE_INTERVAL_SEC if (streaming_card and streaming_card.is_active()) else PROGRESS_PING_INTERVAL_SEC
         while not stop_event.wait(interval_sec):
             try:
-                text = self._progress_ping_text(chat_id=chat_id, started_at=started_at)
+                text = self._progress_ping_text(runtime_key=runtime_key, started_at=started_at)
                 if streaming_card and streaming_card.is_active():
                     streaming_card.update(text)
                 else:
-                    self.feishu.send_text(chat_id, text)
+                    self.feishu.send_text(reply_chat_id, text)
             except Exception as exc:
-                LOG.warning("progress ping failed chat_id=%s err=%s", chat_id, exc)
+                LOG.warning("progress ping failed runtime_key=%s err=%s", runtime_key, exc)
 
-    def _run_turn(self, chat_id: str, text: str, image_paths: Optional[List[str]] = None) -> str:
-        resp = self.control.turn(chat_id=chat_id, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
+    def _run_turn(self, runtime_key: str, text: str, image_paths: Optional[List[str]] = None) -> str:
+        resp = self.control.turn(chat_id=runtime_key, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         answer = str(data.get("assistant_text") or "").strip()
         switch_info = data.get("auto_auth_switch") if isinstance(data.get("auto_auth_switch"), dict) else {}
@@ -1723,14 +1783,15 @@ class AppServerBotBridge:
         return answer or "(assistant returned empty text)"
 
     def _run_session_command(self, chat_id: str, cmd_text: str) -> str:
-        lock = self._chat_lock(chat_id)
+        runtime_key = self._runtime_key(chat_id)
+        lock = self._chat_lock(runtime_key)
         if not lock.acquire(blocking=False):
-            queued = self._enqueue_input(chat_id=chat_id, text=cmd_text, image_paths=[])
+            queued = self._enqueue_input(chat_id=runtime_key, text=cmd_text, image_paths=[])
             return f"当前任务执行中，命令已加入队列（第{queued}条）。"
         try:
             try:
-                answer = self._run_turn(chat_id=chat_id, text=cmd_text, image_paths=[])
-                self._drain_queued_inputs(chat_id)
+                answer = self._run_turn(runtime_key=runtime_key, text=cmd_text, image_paths=[])
+                self._drain_queued_inputs(runtime_key, chat_id)
                 return answer
             except Exception as first_exc:
                 first_err = str(first_exc)
@@ -1744,21 +1805,21 @@ class AppServerBotBridge:
 
                 recovery_steps: List[str] = []
                 try:
-                    self.control.interrupt(chat_id=chat_id)
+                    self.control.interrupt(chat_id=runtime_key)
                     recovery_steps.append("interrupt=ok")
                 except Exception as exc:
                     recovery_steps.append(f"interrupt=err({exc})")
 
                 try:
-                    self.control.reset(chat_id=chat_id)
+                    self.control.reset(chat_id=runtime_key)
                     recovery_steps.append("reset=ok")
                 except Exception as exc:
                     recovery_steps.append(f"reset=err({exc})")
                     return f"会话命令失败: {first_err}\n自动恢复失败: {'; '.join(recovery_steps)}"
 
                 try:
-                    answer = self._run_turn(chat_id=chat_id, text=cmd_text, image_paths=[])
-                    self._drain_queued_inputs(chat_id)
+                    answer = self._run_turn(runtime_key=runtime_key, text=cmd_text, image_paths=[])
+                    self._drain_queued_inputs(runtime_key, chat_id)
                     return answer
                 except Exception as second_exc:
                     return (
@@ -1843,7 +1904,7 @@ class AppServerBotBridge:
             f"model: `{status.get('model') or ''}`",
             f"account: `{auth_profile}`" + (f" ({auth_identity})" if auth_identity else ""),
             f"auto_switch: `{'on' if auto_switch_enabled else 'off'} / {auto_switch_threshold}%`",
-            f"pending_files: `{len(self._list_pending_files(chat_id))}`",
+            f"pending_files: `{len(self._list_pending_files(self._runtime_key(chat_id)))}`",
         ]
         last_from = str(last_auto_switch.get("from") or "").strip() or "default"
         last_to = str(last_auto_switch.get("to") or "").strip() or "default"
@@ -1981,7 +2042,9 @@ class AppServerBotBridge:
             self.feishu.send_card(chat_id, self._build_project_manage_card(chat_id))
             return
 
-        pending_files = self._consume_pending_files(chat_id)
+        active_project = self._ensure_active_project(chat_id)
+        runtime_key = self._ensure_project_runtime(chat_id, active_project) if active_project else str(chat_id or "")
+        pending_files = self._consume_pending_files(runtime_key)
         prompt, image_paths = self._build_prompt_with_files(raw, pending_files)
         typing_reaction_id = ""
         progress_stop = threading.Event()
@@ -1994,18 +2057,18 @@ class AppServerBotBridge:
                 LOG.warning("typing reaction create failed message_id=%s err=%s", message_id or "<none>", exc)
 
         try:
-            lock = self._chat_lock(chat_id)
+            lock = self._chat_lock(runtime_key)
             if not lock.acquire(blocking=False):
-                LOG.info("chat busy, steering message chat_id=%s message_id=%s", chat_id, message_id or "<none>")
+                LOG.info("runtime busy, steering runtime_key=%s message_id=%s", runtime_key, message_id or "<none>")
                 try:
-                    self.control.steer(chat_id=chat_id, text=prompt, image_paths=image_paths)
+                    self.control.steer(chat_id=runtime_key, text=prompt, image_paths=image_paths)
                 except Exception as steer_exc:
-                    queued = self._enqueue_input(chat_id=chat_id, text=prompt, image_paths=image_paths)
+                    queued = self._enqueue_input(chat_id=runtime_key, text=prompt, image_paths=image_paths)
                     self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
                 return
             try:
                 start = time.time()
-                LOG.info("turn start chat_id=%s message_id=%s", chat_id, message_id or "<none>")
+                LOG.info("turn start runtime_key=%s message_id=%s", runtime_key, message_id or "<none>")
                 if STREAMING_CARD_ENABLED and str(message_id or "").strip():
                     try:
                         streaming_card = FeishuStreamingCardSession(
@@ -2019,13 +2082,13 @@ class AppServerBotBridge:
                         streaming_card = None
                 progress_thread = threading.Thread(
                     target=self._progress_ping_loop,
-                    args=(chat_id, start, progress_stop, streaming_card),
+                    args=(runtime_key, chat_id, start, progress_stop, streaming_card),
                     daemon=True,
                 )
                 progress_thread.start()
                 if pending_files:
                     self.feishu.send_text(chat_id, f"检测到 {len(pending_files)} 个附件，已自动带入本轮对话。")
-                answer = self._run_turn(chat_id=chat_id, text=prompt, image_paths=image_paths)
+                answer = self._run_turn(runtime_key=runtime_key, text=prompt, image_paths=image_paths)
                 output_files = self._extract_output_files(answer_text=answer, exclude_paths=pending_files)
                 progress_stop.set()
                 if progress_thread:
@@ -2040,10 +2103,10 @@ class AppServerBotBridge:
                 else:
                     self.feishu.smart_send(chat_id, answer)
                 self._send_output_files(chat_id, output_files)
-                self._drain_queued_inputs(chat_id)
-                LOG.info("turn done chat_id=%s message_id=%s elapsed=%.3fs", chat_id, message_id or "<none>", time.time() - start)
+                self._drain_queued_inputs(runtime_key, chat_id)
+                LOG.info("turn done runtime_key=%s message_id=%s elapsed=%.3fs", runtime_key, message_id or "<none>", time.time() - start)
             except Exception as exc:
-                LOG.exception("turn failed chat_id=%s message_id=%s", chat_id, message_id or "<none>")
+                LOG.exception("turn failed runtime_key=%s message_id=%s", runtime_key, message_id or "<none>")
                 progress_stop.set()
                 if progress_thread:
                     progress_thread.join(timeout=1.0)
@@ -2116,7 +2179,7 @@ class AppServerBotBridge:
             message_id = str(message.get("message_id") or "")
             try:
                 saved = self._download_attachment(chat_id=chat_id, msg_type=msg_type, message_id=message_id, content=content)
-                staged = self._append_pending_file(chat_id, saved)
+                staged = self._append_pending_file(self._runtime_key(chat_id), saved)
                 self.feishu.send_text(
                     chat_id,
                     f"已暂存附件 ({msg_type})\npath={saved}\n当前待处理附件: {staged}\n发送一条文本后将自动带入。",
@@ -2139,7 +2202,7 @@ class AppServerBotBridge:
                             message_id=message_id,
                             content=rcontent,
                         )
-                        self._append_pending_file(chat_id, saved)
+                        self._append_pending_file(self._runtime_key(chat_id), saved)
                     except Exception as exc:
                         LOG.warning(
                             "post resource download failed chat_id=%s message_id=%s type=%s err=%s",
@@ -2153,7 +2216,7 @@ class AppServerBotBridge:
                 self._handle_text(chat_id, post_text, sender_open_id=sender_open_id, message_id=message_id)
                 return
 
-            staged = len(self._list_pending_files(chat_id))
+            staged = len(self._list_pending_files(self._runtime_key(chat_id)))
             if staged > 0:
                 self.feishu.send_text(chat_id, f"已暂存 {staged} 个 post 附件。请再发一条文本指令继续处理。")
                 return
@@ -2293,8 +2356,14 @@ class AppServerBotBridge:
                 return
             try:
                 self._set_await_project_name(chat_id, False)
-                self.control.reset(chat_id=chat_id, cwd=cwd)
-                self.feishu.send_text(chat_id, f"已切换项目: {project}\ncwd={cwd}")
+                self._set_active_project(chat_id, project)
+                runtime_key = self._ensure_project_runtime(chat_id, project)
+                status = self.control.status(runtime_key).get("data") if runtime_key else {}
+                thread_id = str((status or {}).get("thread_id") or "").strip()
+                if thread_id:
+                    self.feishu.send_text(chat_id, f"已切换到项目: {project}\n已恢复该项目最近会话。")
+                else:
+                    self.feishu.send_text(chat_id, f"已切换到项目: {project}\n该项目暂时还没有历史会话，下一条消息会新开一条。")
             except Exception as exc:
                 self.feishu.send_text(chat_id, f"切换项目失败: {exc}")
             return
@@ -2309,7 +2378,7 @@ class AppServerBotBridge:
 
         if op == "session_interrupt":
             try:
-                result = self.control.interrupt(chat_id)
+                result = self.control.interrupt(self._runtime_key(chat_id))
                 self.feishu.send_text(chat_id, _trim(f"中断结果:\n{json.dumps(result, ensure_ascii=False)}", 900))
             except Exception as exc:
                 self.feishu.send_text(chat_id, f"中断失败: {exc}")
@@ -2347,9 +2416,10 @@ class AppServerBotBridge:
         if op == "session_auth_apply":
             profile = str(value.get("profile") or "").strip()
             try:
-                result = self.control.update_auth_profile(chat_id=chat_id, profile=profile)
+                runtime_key = self._runtime_key(chat_id)
+                result = self.control.update_auth_profile(chat_id=runtime_key, profile=profile)
                 data = result.get("data") if isinstance(result.get("data"), dict) else {}
-                self.control.reset(chat_id=chat_id)
+                self.control.reset(chat_id=runtime_key)
                 label = str(data.get("auth_profile") or "").strip() or "default"
                 identity = str(data.get("auth_identity") or "").strip()
                 suffix = f" ({identity})" if identity else ""
@@ -2379,7 +2449,7 @@ class AppServerBotBridge:
             synced_model = _extract_status_value(verify, "effective_model") or _extract_status_value(verify, "model") or model
             sync_note = ""
             try:
-                self.control.update_config(chat_id=chat_id, model=synced_model)
+                self.control.update_config(chat_id=self._runtime_key(chat_id), model=synced_model)
             except Exception as exc:
                 sync_note = f"\n\nconfig_sync_failed: {exc}"
             self.feishu.smart_send(
