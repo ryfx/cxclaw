@@ -85,7 +85,7 @@ TYPING_REACTION_ENABLED = str(os.getenv("BRIDGE_TYPING_REACTION_ENABLED", "true"
     "yes",
     "on",
 }
-OUTPUT_FILE_AUTO_SEND = str(os.getenv("BRIDGE_OUTPUT_FILE_AUTO_SEND", "true")).strip().lower() in {
+OUTPUT_FILE_AUTO_SEND = str(os.getenv("BRIDGE_OUTPUT_FILE_AUTO_SEND", "false")).strip().lower() in {
     "1",
     "true",
     "yes",

@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -73,6 +74,10 @@ AUTH_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_HOMES_DIR", str(D
 AUTH_REGISTRY_PATH = _resolve_env_path(
     os.environ.get("BRIDGE_AUTH_REGISTRY_PATH", str(DATA_DIR / "auth_profiles_registry.json"))
 )
+DEFAULT_CODEX_HOME = _resolve_env_path(os.environ.get("BRIDGE_DEFAULT_CODEX_HOME", str(Path.home() / ".codex")))
+BRIDGE_MCP_SERVER_NAME = str(os.environ.get("BRIDGE_MCP_SERVER_NAME", "feishu-bridge-files")).strip() or "feishu-bridge-files"
+BRIDGE_MCP_SERVER_PATH = _resolve_env_path(os.environ.get("BRIDGE_MCP_SERVER_PATH", str(APP_DIR / "bridge_mcp_server.py")))
+BRIDGE_MCP_PYTHON = str(Path(os.environ.get("BRIDGE_MCP_PYTHON", sys.executable)).expanduser())
 PROJECTS_STORE_PATH = _resolve_env_path(os.environ.get("BRIDGE_PROJECTS_STORE_PATH", str(DATA_DIR / "projects.json")))
 HISTORY_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_PATH", str(DATA_DIR / "history.json")))
 HISTORY_DB_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_DB_PATH", str(DATA_DIR / "history.db")))
@@ -548,6 +553,7 @@ def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
         getattr(body, "approval_policy", "") or runtime.approval_policy or DEFAULT_APPROVAL
     )
     runtime.personality = str(getattr(body, "personality", "") or runtime.personality or DEFAULT_PERSONALITY)
+    _apply_runtime_bridge_env(runtime)
 
 
 def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -607,6 +613,83 @@ def _profile_home_dir(profile: str) -> Path:
     return AUTH_HOMES_DIR / str(profile or "").strip()
 
 
+def _codex_home_for_profile(profile: str) -> Path:
+    clean = str(profile or "").strip()
+    return _profile_home_dir(clean) if clean else DEFAULT_CODEX_HOME
+
+
+def _run_codex_mcp(home_dir: Path, args: List[str]) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home_dir)
+    return subprocess.run(
+        ["codex", "mcp", *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+
+def _ensure_bridge_mcp_server_installed(home_dir: Path) -> None:
+    target_home = Path(home_dir).expanduser()
+    target_home.mkdir(parents=True, exist_ok=True)
+    if not BRIDGE_MCP_SERVER_PATH.exists():
+        LOG.warning("bridge MCP server script missing path=%s", BRIDGE_MCP_SERVER_PATH)
+        return
+    try:
+        current = _run_codex_mcp(target_home, ["get", BRIDGE_MCP_SERVER_NAME, "--json"])
+    except Exception as exc:
+        LOG.warning("codex mcp get failed home=%s err=%s", target_home, exc)
+        return
+    if current.returncode == 0:
+        return
+    try:
+        added = _run_codex_mcp(
+            target_home,
+            [
+                "add",
+                BRIDGE_MCP_SERVER_NAME,
+                "--",
+                BRIDGE_MCP_PYTHON,
+                str(BRIDGE_MCP_SERVER_PATH),
+            ],
+        )
+    except Exception as exc:
+        LOG.warning("codex mcp add failed home=%s err=%s", target_home, exc)
+        return
+    if added.returncode != 0:
+        LOG.warning(
+            "codex mcp add failed home=%s rc=%s stdout=%s stderr=%s",
+            target_home,
+            added.returncode,
+            (added.stdout or "").strip(),
+            (added.stderr or "").strip(),
+        )
+
+
+def _ensure_bridge_mcp_server_for_known_homes() -> None:
+    homes: List[Path] = [DEFAULT_CODEX_HOME]
+    if AUTH_HOMES_DIR.exists():
+        for path in sorted(AUTH_HOMES_DIR.iterdir()):
+            if path.is_dir():
+                homes.append(path)
+    seen: set[str] = set()
+    for home in homes:
+        key = str(home.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        _ensure_bridge_mcp_server_installed(home)
+
+
+def _apply_runtime_bridge_env(runtime: ChatRuntime) -> None:
+    runtime.client.env["BRIDGE_STATE_PATH"] = str(_state_path.resolve())
+    runtime.client.env["BRIDGE_MCP_DEFAULT_CHAT_ID"] = _runtime_actual_chat_id(runtime.chat_id)
+    runtime.client.env["BRIDGE_MCP_DEFAULT_PROJECT"] = _runtime_project_name(runtime.chat_id)
+    runtime.client.env["BRIDGE_MCP_RUNTIME_CWD"] = str(Path(runtime.cwd or DEFAULT_CWD).expanduser().resolve())
+
+
 def _decode_jwt_payload(token: str) -> Dict[str, Any]:
     parts = str(token or "").split(".")
     if len(parts) < 2:
@@ -652,6 +735,7 @@ def _validate_auth_profile_file(source: Path) -> Dict[str, Any]:
     home_dir = _profile_home_dir(profile)
     home_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, home_dir / "auth.json")
+    _ensure_bridge_mcp_server_installed(home_dir)
 
     cfg = source.with_name(f"{profile}.config.toml")
     if cfg.exists() and cfg.is_file():
@@ -749,10 +833,10 @@ def _rate_limit_exhausted(rate_limits: Dict[str, Any]) -> bool:
 
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
     profile = str(runtime.auth_profile or "").strip()
-    if profile:
-        runtime.client.env["CODEX_HOME"] = str(_profile_home_dir(profile))
-    else:
-        runtime.client.env.pop("CODEX_HOME", None)
+    target_home = _codex_home_for_profile(profile)
+    _ensure_bridge_mcp_server_installed(target_home)
+    runtime.client.env["CODEX_HOME"] = str(target_home)
+    _apply_runtime_bridge_env(runtime)
 
 
 def _switch_runtime_auth_profile(runtime: ChatRuntime, profile: str, reason: str = "") -> Dict[str, Any]:
@@ -1532,6 +1616,10 @@ APP.include_router(ROUTER)
 @APP.on_event("startup")
 def _on_startup() -> None:
     global _IDLE_SWEEPER_THREAD
+    try:
+        _ensure_bridge_mcp_server_for_known_homes()
+    except Exception as exc:
+        LOG.warning("ensure bridge MCP server on startup failed err=%s", exc)
     if IDLE_EVICT_SEC <= 0:
         LOG.info("idle sweeper disabled idle_evict_sec=%s", IDLE_EVICT_SEC)
         return

@@ -98,10 +98,13 @@
 - streaming card：`BRIDGE_STREAMING_CARD_ENABLED=true`
 - typing reaction：`BRIDGE_TYPING_REACTION_ENABLED=true`
 - 卡片按钮后自动删卡：`BRIDGE_CARD_AUTO_DELETE_ON_ACTION=true`
-- 输出文件自动回传：`BRIDGE_OUTPUT_FILE_AUTO_SEND=true`
+- 输出文件自动回传：`BRIDGE_OUTPUT_FILE_AUTO_SEND=false`
 - 输出文件数量上限：`BRIDGE_OUTPUT_FILE_MAX_COUNT=0`
 - 输出文件大小上限：`BRIDGE_OUTPUT_FILE_MAX_SIZE_MB=30`
 - 输出文件扫描年龄：`BRIDGE_OUTPUT_FILE_MAX_AGE_SEC=3600`
+- 默认文件回传 MCP 名称：`BRIDGE_MCP_SERVER_NAME=feishu-bridge-files`
+- MCP 文件允许目录：`BRIDGE_MCP_FILE_ALLOWED_DIRS=/root/bridgespace/projects`
+- MCP 文件大小上限：`BRIDGE_MCP_FILE_MAX_SIZE_MB=30`
 
 `app.py` 和 `long_conn.py` 都会自动加载 `.env`。
 
