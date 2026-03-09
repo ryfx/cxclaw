@@ -81,6 +81,12 @@ BRIDGE_MCP_PYTHON = str(Path(os.environ.get("BRIDGE_MCP_PYTHON", sys.executable)
 BRIDGE_MCP_REPLY_CONTEXT_PATH = _resolve_env_path(
     os.environ.get("BRIDGE_MCP_REPLY_CONTEXT_PATH", str(DATA_DIR / "reply_context.json"))
 )
+BRIDGE_MCP_TOOL_HINT_ENABLED = str(os.environ.get("BRIDGE_MCP_TOOL_HINT_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 PROJECTS_STORE_PATH = _resolve_env_path(os.environ.get("BRIDGE_PROJECTS_STORE_PATH", str(DATA_DIR / "projects.json")))
 HISTORY_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_PATH", str(DATA_DIR / "history.json")))
 HISTORY_DB_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_DB_PATH", str(DATA_DIR / "history.db")))
@@ -103,6 +109,14 @@ FEISHU_OAUTH_TOKEN_URLS = [
 FEISHU_OAUTH_USERINFO_URL = str(
     os.environ.get("FEISHU_OAUTH_USERINFO_URL", "https://open.feishu.cn/open-apis/authen/v1/user_info")
 ).strip()
+MCP_TOOL_HINT_BEGIN = "<bridge_mcp_tool_hint>"
+MCP_TOOL_HINT_END = "</bridge_mcp_tool_hint>"
+MCP_FILE_TOOL_HINT = (
+    "MCP tools available in this environment: feishu_send_file and feishu_send_files. "
+    "Use them when the user wants a local file sent back to Feishu. "
+    "Do not decide MCP availability from resources or resource templates, because this bridge exposes tools only. "
+    "If file delivery is requested, prefer calling the tool explicitly instead of only mentioning file paths."
+)
 
 
 class TurnRequest(BaseModel):
@@ -487,6 +501,26 @@ def _project_label_for_cwd(cwd: str) -> str:
     if resolved:
         return Path(resolved).name or resolved
     return "未命名项目"
+
+
+def _inject_mcp_tool_hint(text: str) -> str:
+    raw = str(text or "")
+    if not BRIDGE_MCP_TOOL_HINT_ENABLED:
+        return raw
+    if MCP_TOOL_HINT_BEGIN in raw:
+        return raw
+    return f"{MCP_TOOL_HINT_BEGIN}\n{MCP_FILE_TOOL_HINT}\n{MCP_TOOL_HINT_END}\n\n{raw}".strip()
+
+
+def _strip_mcp_tool_hint(text: str) -> str:
+    raw = str(text or "")
+    if MCP_TOOL_HINT_BEGIN not in raw:
+        return raw
+    pattern = re.compile(
+        rf"{re.escape(MCP_TOOL_HINT_BEGIN)}.*?{re.escape(MCP_TOOL_HINT_END)}\s*",
+        re.S,
+    )
+    return pattern.sub("", raw, count=1).strip()
 
 
 def _runtime_actual_chat_id(runtime_id: str) -> str:
@@ -1126,6 +1160,8 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     turn_cwd = ""
     turn_model = ""
     turn_auth_profile = ""
+    visible_user_text = _strip_mcp_tool_hint(body.text)
+    turn_input_text = _inject_mcp_tool_hint(body.text)
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
@@ -1174,7 +1210,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         try:
             turn_start = runtime.client.turn_start(
                 thread_id=thread_id,
-                text=body.text,
+                text=turn_input_text,
                 image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
             )
         except AppServerError as exc:
@@ -1184,7 +1220,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     thread_id = _ensure_thread(runtime, reset_thread=True)
                     turn_start = runtime.client.turn_start(
                         thread_id=thread_id,
-                        text=body.text,
+                        text=turn_input_text,
                         image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
                     )
                 else:
@@ -1211,7 +1247,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
 
         runtime.active_turn_id = turn_id
         turn_started_at = int(time.time())
-        _persist_runtime(runtime, {"last_user_text": str(body.text), "last_error": ""})
+        _persist_runtime(runtime, {"last_user_text": visible_user_text, "last_error": ""})
 
     try:
         done = runtime.client.wait_for_turn_completion(
@@ -1247,7 +1283,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 status=done.turn_status,
                 started_at=turn_started_at,
                 ended_at=int(time.time()),
-                user_text=str(body.text),
+                user_text=visible_user_text,
                 assistant_text=done.text,
                 error_text=json.dumps(done.error, ensure_ascii=False) if done.error else "",
                 thread_id=thread_id,
@@ -1285,7 +1321,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 status="timeout",
                 started_at=turn_started_at,
                 ended_at=int(time.time()),
-                user_text=str(body.text),
+                user_text=visible_user_text,
                 assistant_text="",
                 error_text=str(exc),
                 thread_id=thread_id,
@@ -1315,7 +1351,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 status="failed",
                 started_at=turn_started_at,
                 ended_at=int(time.time()),
-                user_text=str(body.text),
+                user_text=visible_user_text,
                 assistant_text="",
                 error_text=str(exc),
                 thread_id=thread_id,
@@ -1333,6 +1369,8 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
 @ROUTER.post("/chat/{chat_id}/turn/steer", dependencies=[Depends(require_api_token)])
 def chat_turn_steer(chat_id: str, body: SteerTurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
+    visible_user_text = _strip_mcp_tool_hint(body.text)
+    steer_input_text = _inject_mcp_tool_hint(body.text)
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         try:
@@ -1369,7 +1407,7 @@ def chat_turn_steer(chat_id: str, body: SteerTurnRequest) -> Dict[str, Any]:
             steer = runtime.client.turn_steer(
                 thread_id=thread_id,
                 expected_turn_id=expected_turn_id,
-                text=body.text,
+                text=steer_input_text,
                 image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
             )
         except AppServerError as exc:
@@ -1381,7 +1419,7 @@ def chat_turn_steer(chat_id: str, body: SteerTurnRequest) -> Dict[str, Any]:
 
         steer_turn_id = str(steer.get("turnId") or active_turn_id)
         runtime.active_turn_id = steer_turn_id
-        state = _persist_runtime(runtime, {"last_user_text": str(body.text), "last_error": ""})
+        state = _persist_runtime(runtime, {"last_user_text": visible_user_text, "last_error": ""})
         return {
             "ok": True,
             "data": {
