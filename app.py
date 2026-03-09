@@ -71,6 +71,7 @@ def _resolve_env_path(raw: str) -> Path:
 
 AUTH_PROFILES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_PROFILES_DIR", str(DATA_DIR / "auth_profiles")))
 AUTH_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_HOMES_DIR", str(DATA_DIR / "auth_homes")))
+RUNTIME_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_RUNTIME_HOMES_DIR", str(DATA_DIR / "runtime_homes")))
 AUTH_REGISTRY_PATH = _resolve_env_path(
     os.environ.get("BRIDGE_AUTH_REGISTRY_PATH", str(DATA_DIR / "auth_profiles_registry.json"))
 )
@@ -81,12 +82,6 @@ BRIDGE_MCP_PYTHON = str(Path(os.environ.get("BRIDGE_MCP_PYTHON", sys.executable)
 BRIDGE_MCP_REPLY_CONTEXT_PATH = _resolve_env_path(
     os.environ.get("BRIDGE_MCP_REPLY_CONTEXT_PATH", str(DATA_DIR / "reply_context.json"))
 )
-BRIDGE_MCP_TOOL_HINT_ENABLED = str(os.environ.get("BRIDGE_MCP_TOOL_HINT_ENABLED", "true")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 PROJECTS_STORE_PATH = _resolve_env_path(os.environ.get("BRIDGE_PROJECTS_STORE_PATH", str(DATA_DIR / "projects.json")))
 HISTORY_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_PATH", str(DATA_DIR / "history.json")))
 HISTORY_DB_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_DB_PATH", str(DATA_DIR / "history.db")))
@@ -109,14 +104,6 @@ FEISHU_OAUTH_TOKEN_URLS = [
 FEISHU_OAUTH_USERINFO_URL = str(
     os.environ.get("FEISHU_OAUTH_USERINFO_URL", "https://open.feishu.cn/open-apis/authen/v1/user_info")
 ).strip()
-MCP_TOOL_HINT_BEGIN = "<bridge_mcp_tool_hint>"
-MCP_TOOL_HINT_END = "</bridge_mcp_tool_hint>"
-MCP_FILE_TOOL_HINT_BASE = (
-    "MCP tools available in this environment: feishu_send_file and feishu_send_files. "
-    "Use them when the user wants a local file sent back to Feishu. "
-    "Do not decide MCP availability from resources or resource templates, because this bridge exposes tools only. "
-    "If file delivery is requested, call the tool explicitly instead of only mentioning file paths."
-)
 
 
 class TurnRequest(BaseModel):
@@ -503,17 +490,6 @@ def _project_label_for_cwd(cwd: str) -> str:
     return "未命名项目"
 
 
-def _strip_mcp_tool_hint(text: str) -> str:
-    raw = str(text or "")
-    if MCP_TOOL_HINT_BEGIN not in raw:
-        return raw
-    pattern = re.compile(
-        rf"{re.escape(MCP_TOOL_HINT_BEGIN)}.*?{re.escape(MCP_TOOL_HINT_END)}\s*",
-        re.S,
-    )
-    return pattern.sub("", raw, count=1).strip()
-
-
 def _load_reply_context_map() -> Dict[str, Dict[str, Any]]:
     if not BRIDGE_MCP_REPLY_CONTEXT_PATH.exists():
         return {}
@@ -540,24 +516,6 @@ def _reply_anchor_for_runtime(runtime_id: str) -> Dict[str, str]:
         "chat_id": str(item.get("chat_id") or "").strip(),
         "reply_to_message_id": str(item.get("message_id") or "").strip(),
     }
-
-
-def _inject_runtime_mcp_tool_hint(text: str, runtime_id: str) -> str:
-    raw = _strip_mcp_tool_hint(text)
-    if not BRIDGE_MCP_TOOL_HINT_ENABLED:
-        return raw
-    actual_chat_id = _runtime_actual_chat_id(runtime_id)
-    anchor = _reply_anchor_for_runtime(runtime_id)
-    reply_to_message_id = str(anchor.get("reply_to_message_id") or "").strip()
-    hint_lines = [MCP_FILE_TOOL_HINT_BASE]
-    if actual_chat_id:
-        hint_lines.append(f"For this turn, pass chat_id=\"{actual_chat_id}\" when calling the file tool.")
-    if reply_to_message_id:
-        hint_lines.append(
-            f"For this turn, pass reply_to_message_id=\"{reply_to_message_id}\" so the file replies to the trigger message."
-        )
-    hint = " ".join(hint_lines).strip()
-    return f"{MCP_TOOL_HINT_BEGIN}\n{hint}\n{MCP_TOOL_HINT_END}\n\n{raw}".strip()
 
 
 def _runtime_actual_chat_id(runtime_id: str) -> str:
@@ -692,6 +650,17 @@ def _codex_home_for_profile(profile: str) -> Path:
     return _profile_home_dir(clean) if clean else DEFAULT_CODEX_HOME
 
 
+def _runtime_home_name(runtime_id: str) -> str:
+    raw = str(runtime_id or "").strip() or "runtime"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._") or "runtime"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{safe[:64]}-{digest}"
+
+
+def _runtime_home_dir(runtime_id: str) -> Path:
+    return RUNTIME_HOMES_DIR / _runtime_home_name(runtime_id)
+
+
 def _run_codex_mcp(home_dir: Path, args: List[str]) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(home_dir)
@@ -705,30 +674,57 @@ def _run_codex_mcp(home_dir: Path, args: List[str]) -> subprocess.CompletedProce
     )
 
 
-def _ensure_bridge_mcp_server_installed(home_dir: Path) -> None:
+def _ensure_bridge_mcp_server_installed(home_dir: Path, server_env: Optional[Dict[str, str]] = None) -> None:
     target_home = Path(home_dir).expanduser()
     target_home.mkdir(parents=True, exist_ok=True)
     if not BRIDGE_MCP_SERVER_PATH.exists():
         LOG.warning("bridge MCP server script missing path=%s", BRIDGE_MCP_SERVER_PATH)
         return
+    expected_env = {
+        str(k or "").strip(): str(v or "").strip()
+        for k, v in dict(server_env or {}).items()
+        if str(k or "").strip() and str(v or "").strip()
+    }
+    need_reinstall = False
     try:
         current = _run_codex_mcp(target_home, ["get", BRIDGE_MCP_SERVER_NAME, "--json"])
     except Exception as exc:
         LOG.warning("codex mcp get failed home=%s err=%s", target_home, exc)
         return
     if current.returncode == 0:
-        return
-    try:
-        added = _run_codex_mcp(
-            target_home,
-            [
-                "add",
-                BRIDGE_MCP_SERVER_NAME,
-                "--",
-                BRIDGE_MCP_PYTHON,
-                str(BRIDGE_MCP_SERVER_PATH),
-            ],
+        try:
+            current_info = json.loads(current.stdout or "{}")
+        except Exception:
+            current_info = {}
+        transport = current_info.get("transport") if isinstance(current_info, dict) else {}
+        if not isinstance(transport, dict):
+            transport = {}
+        current_env = transport.get("env") if isinstance(transport.get("env"), dict) else {}
+        current_args = [str(x) for x in list(transport.get("args") or [])]
+        current_command = str(transport.get("command") or "")
+        need_reinstall = (
+            current_command != BRIDGE_MCP_PYTHON
+            or current_args != [str(BRIDGE_MCP_SERVER_PATH)]
+            or current_env != expected_env
         )
+        if not need_reinstall:
+            return
+        removed = _run_codex_mcp(target_home, ["remove", BRIDGE_MCP_SERVER_NAME])
+        if removed.returncode != 0:
+            LOG.warning(
+                "codex mcp remove failed home=%s rc=%s stdout=%s stderr=%s",
+                target_home,
+                removed.returncode,
+                (removed.stdout or "").strip(),
+                (removed.stderr or "").strip(),
+            )
+            return
+    try:
+        add_args: List[str] = ["add", BRIDGE_MCP_SERVER_NAME]
+        for key, value in sorted(expected_env.items()):
+            add_args.extend(["--env", f"{key}={value}"])
+        add_args.extend(["--", BRIDGE_MCP_PYTHON, str(BRIDGE_MCP_SERVER_PATH)])
+        added = _run_codex_mcp(target_home, add_args)
     except Exception as exc:
         LOG.warning("codex mcp add failed home=%s err=%s", target_home, exc)
         return
@@ -740,6 +736,41 @@ def _ensure_bridge_mcp_server_installed(home_dir: Path) -> None:
             (added.stdout or "").strip(),
             (added.stderr or "").strip(),
         )
+
+
+def _bridge_mcp_env_for_runtime(runtime: ChatRuntime) -> Dict[str, str]:
+    current_cwd = str(Path(runtime.cwd or DEFAULT_CWD).expanduser().resolve())
+    anchor = _reply_anchor_for_runtime(runtime.chat_id)
+    env = {
+        "FEISHU_APP_ID": FEISHU_APP_ID,
+        "FEISHU_APP_SECRET": FEISHU_APP_SECRET,
+        "BRIDGE_STATE_PATH": str(_state_path.resolve()),
+        "BRIDGE_MCP_RUNTIME_ID": str(runtime.chat_id or ""),
+        "BRIDGE_MCP_DEFAULT_CHAT_ID": str(anchor.get("chat_id") or _runtime_actual_chat_id(runtime.chat_id) or ""),
+        "BRIDGE_MCP_DEFAULT_PROJECT": _runtime_project_name(runtime.chat_id),
+        "BRIDGE_MCP_RUNTIME_CWD": current_cwd,
+        "BRIDGE_MCP_REPLY_CONTEXT_PATH": str(BRIDGE_MCP_REPLY_CONTEXT_PATH),
+        "BRIDGE_MCP_FILE_ALLOWED_DIRS": current_cwd,
+    }
+    return {k: v for k, v in env.items() if str(v or "").strip()}
+
+
+def _sync_runtime_home(runtime: ChatRuntime) -> Path:
+    source_home = _codex_home_for_profile(runtime.auth_profile)
+    target_home = _runtime_home_dir(runtime.chat_id)
+    target_home.mkdir(parents=True, exist_ok=True)
+    for filename in ("auth.json", "config.toml"):
+        src = source_home / filename
+        dst = target_home / filename
+        if src.exists() and src.is_file():
+            shutil.copy2(src, dst)
+        elif dst.exists():
+            try:
+                dst.unlink()
+            except Exception:
+                pass
+    _ensure_bridge_mcp_server_installed(target_home, server_env=_bridge_mcp_env_for_runtime(runtime))
+    return target_home
 
 
 def _ensure_bridge_mcp_server_for_known_homes() -> None:
@@ -908,9 +939,7 @@ def _rate_limit_exhausted(rate_limits: Dict[str, Any]) -> bool:
 
 
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
-    profile = str(runtime.auth_profile or "").strip()
-    target_home = _codex_home_for_profile(profile)
-    _ensure_bridge_mcp_server_installed(target_home)
+    target_home = _sync_runtime_home(runtime)
     runtime.client.env["CODEX_HOME"] = str(target_home)
     _apply_runtime_bridge_env(runtime)
 
@@ -1197,8 +1226,8 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     turn_cwd = ""
     turn_model = ""
     turn_auth_profile = ""
-    visible_user_text = _strip_mcp_tool_hint(body.text)
-    turn_input_text = _inject_runtime_mcp_tool_hint(body.text, chat_id)
+    visible_user_text = str(body.text or "")
+    turn_input_text = visible_user_text
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
@@ -1406,8 +1435,8 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
 @ROUTER.post("/chat/{chat_id}/turn/steer", dependencies=[Depends(require_api_token)])
 def chat_turn_steer(chat_id: str, body: SteerTurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
-    visible_user_text = _strip_mcp_tool_hint(body.text)
-    steer_input_text = _inject_runtime_mcp_tool_hint(body.text, chat_id)
+    visible_user_text = str(body.text or "")
+    steer_input_text = visible_user_text
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         try:
