@@ -2553,7 +2553,6 @@ class AppServerBotBridge:
                 runtime_key = self._ensure_project_runtime(chat_id, project)
                 status = self.control.status(runtime_key).get("data") if runtime_key else {}
                 thread_id = str((status or {}).get("thread_id") or "").strip()
-                last_turn_id = str((status or {}).get("state") or {}).strip() if False else ""
                 last_turn_id = str(((status or {}).get("state") or {}).get("last_turn_id") or (status or {}).get("last_turn_id") or "").strip()
                 last_user_text = str(((status or {}).get("state") or {}).get("last_user_text") or (status or {}).get("last_user_text") or "").strip()
                 has_history = bool(thread_id or last_turn_id or last_user_text)
