@@ -67,6 +67,16 @@ USER_CHAT_MAP_PATH = Path(os.getenv("BRIDGE_USER_CHAT_MAP_PATH", str(APP_DIR / "
 if not USER_CHAT_MAP_PATH.is_absolute():
     USER_CHAT_MAP_PATH = APP_DIR / USER_CHAT_MAP_PATH
 USER_CHAT_MAP_PATH = USER_CHAT_MAP_PATH.resolve()
+STATE_PATH = Path(os.getenv("BRIDGE_STATE_PATH", str(APP_DIR / "data" / "state.json"))).expanduser()
+if not STATE_PATH.is_absolute():
+    STATE_PATH = APP_DIR / STATE_PATH
+STATE_PATH = STATE_PATH.resolve()
+ACTIVE_PROJECTS_STORE_PATH = Path(
+    os.getenv("BRIDGE_ACTIVE_PROJECTS_STORE_PATH", str(APP_DIR / "data" / "active_projects.json"))
+).expanduser()
+if not ACTIVE_PROJECTS_STORE_PATH.is_absolute():
+    ACTIVE_PROJECTS_STORE_PATH = APP_DIR / ACTIVE_PROJECTS_STORE_PATH
+ACTIVE_PROJECTS_STORE_PATH = ACTIVE_PROJECTS_STORE_PATH.resolve()
 REPLY_CONTEXT_PATH = Path(os.getenv("BRIDGE_MCP_REPLY_CONTEXT_PATH", str(APP_DIR / "data" / "reply_context.json"))).expanduser()
 if not REPLY_CONTEXT_PATH.is_absolute():
     REPLY_CONTEXT_PATH = APP_DIR / REPLY_CONTEXT_PATH
@@ -1162,6 +1172,8 @@ class AppServerBotBridge:
         self.project_root = Path(project_root).expanduser().resolve()
         self.projects_store_path = Path(projects_store_path).expanduser().resolve()
         self.user_chat_map_path = Path(user_chat_map_path).expanduser().resolve()
+        self.state_path = STATE_PATH
+        self.active_projects_store_path = ACTIVE_PROJECTS_STORE_PATH
         self.projects = {str(k): str(v) for k, v in projects.items() if str(k).strip() and str(v).strip()}
 
         self._event_lock = threading.Lock()
@@ -1187,6 +1199,7 @@ class AppServerBotBridge:
 
         self._load_persisted_projects()
         self._load_persisted_user_chat_map()
+        self._load_persisted_active_projects()
 
     def handle_event_async(self, payload: Dict[str, Any]) -> None:
         threading.Thread(target=self._handle_event_safe, args=(payload,), daemon=True).start()
@@ -1299,6 +1312,35 @@ class AppServerBotBridge:
         path = self.user_chat_map_path
         with self._user_chat_lock:
             payload = {str(k): str(v) for k, v in self._user_chat_map.items() if str(k).strip() and str(v).strip()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _load_persisted_active_projects(self) -> None:
+        path = self.active_projects_store_path
+        if not path.exists():
+            return
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load active projects failed path=%s err=%s", path, exc)
+            return
+        if not isinstance(obj, dict):
+            return
+        loaded: Dict[str, str] = {}
+        for k, v in obj.items():
+            cid = str(k or "").strip()
+            project = str(v or "").strip()
+            if cid and project:
+                loaded[cid] = project
+        if not loaded:
+            return
+        with self._active_project_lock:
+            self._active_project.update(loaded)
+
+    def _persist_active_projects(self) -> None:
+        path = self.active_projects_store_path
+        with self._active_project_lock:
+            payload = {str(k): str(v) for k, v in self._active_project.items() if str(k).strip() and str(v).strip()}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1675,11 +1717,51 @@ class AppServerBotBridge:
                 self._active_project[cid] = project
             else:
                 self._active_project.pop(cid, None)
+        self._persist_active_projects()
+
+    def _latest_project_runtime(self, chat_id: str) -> str:
+        cid = str(chat_id or "").strip()
+        if not cid or not self.state_path.exists():
+            return ""
+        try:
+            obj = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        chats = obj.get("chats") if isinstance(obj, dict) else {}
+        if not isinstance(chats, dict):
+            return ""
+        best_project = ""
+        best_ts = -1
+        for runtime_id, item in chats.items():
+            rid = str(runtime_id or "").strip()
+            if not rid.startswith(f"{cid}::") or not isinstance(item, dict):
+                continue
+            project = str(item.get("project") or "").strip() or rid.split("::", 1)[1].strip()
+            if not project:
+                continue
+            with self._projects_lock:
+                exists = project in self.projects
+            if not exists:
+                continue
+            ts = max(int(item.get("last_input_at") or 0), int(item.get("updated_at") or 0), int(item.get("last_turn_at") or 0))
+            if ts > best_ts:
+                best_ts = ts
+                best_project = project
+        return best_project
 
     def _ensure_active_project(self, chat_id: str) -> str:
+        self._load_persisted_projects()
         active = self._get_active_project(chat_id)
         if active:
-            return active
+            with self._projects_lock:
+                known = active in self.projects
+            if known:
+                return active
+            self._set_active_project(chat_id, "")
+        recent = self._latest_project_runtime(chat_id)
+        if recent:
+            self._set_active_project(chat_id, recent)
+            return recent
         try:
             legacy = self.control.status(str(chat_id or "")).get("data")
         except Exception:
