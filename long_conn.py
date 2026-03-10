@@ -2553,8 +2553,12 @@ class AppServerBotBridge:
                 runtime_key = self._ensure_project_runtime(chat_id, project)
                 status = self.control.status(runtime_key).get("data") if runtime_key else {}
                 thread_id = str((status or {}).get("thread_id") or "").strip()
-                if thread_id:
-                    self.feishu.send_text(chat_id, f"已切换到项目: {project}\n已恢复该项目最近会话。")
+                last_turn_id = str((status or {}).get("state") or {}).strip() if False else ""
+                last_turn_id = str(((status or {}).get("state") or {}).get("last_turn_id") or (status or {}).get("last_turn_id") or "").strip()
+                last_user_text = str(((status or {}).get("state") or {}).get("last_user_text") or (status or {}).get("last_user_text") or "").strip()
+                has_history = bool(thread_id or last_turn_id or last_user_text)
+                if has_history:
+                    self.feishu.send_text(chat_id, f"已切换到项目: {project}\n下一条消息会继续该项目最近会话。")
                 else:
                     self.feishu.send_text(chat_id, f"已切换到项目: {project}\n该项目暂时还没有历史会话，下一条消息会新开一条。")
             except Exception as exc:
