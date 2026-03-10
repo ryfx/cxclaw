@@ -1633,7 +1633,79 @@ class AppServerBotBridge:
                 continue
             seen.add(sig)
             uniq.append((t, obj))
-        return text, uniq
+        if text or uniq:
+            return text, uniq
+
+        fallback_texts: List[str] = []
+        fallback_resources: List[Tuple[str, Dict[str, Any]]] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+
+            tag = str(node.get("tag") or node.get("type") or "").strip().lower()
+            if tag == "text":
+                txt = str(node.get("text") or node.get("content") or "").strip()
+                if txt:
+                    fallback_texts.append(txt)
+            elif tag == "a":
+                txt = str(node.get("text") or node.get("href") or node.get("url") or "").strip()
+                if txt:
+                    fallback_texts.append(txt)
+            elif tag == "at":
+                txt = str(node.get("user_name") or node.get("name") or node.get("text") or "").strip()
+                if txt:
+                    fallback_texts.append(f"@{txt}")
+            elif tag == "img":
+                image_key = str(node.get("image_key") or "").strip()
+                if image_key:
+                    fallback_resources.append(("image", {"image_key": image_key}))
+            elif tag in {"file", "media", "audio", "video"}:
+                obj: Dict[str, Any] = {}
+                for key in ("file_key", "media_key", "audio_key", "video_key", "file_token", "file_name", "name", "title"):
+                    val = node.get(key)
+                    if val not in (None, ""):
+                        obj[key] = val
+                if obj:
+                    fallback_resources.append((tag, obj))
+            elif str(node.get("image_key") or "").strip():
+                fallback_resources.append(("image", {"image_key": str(node.get("image_key") or "").strip()}))
+            elif any(str(node.get(key) or "").strip() for key in ("file_key", "media_key", "audio_key", "video_key", "file_token")):
+                inferred = "file"
+                for candidate in ("file", "media", "audio", "video"):
+                    if str(node.get(f"{candidate}_key") or "").strip():
+                        inferred = candidate
+                        break
+                obj = {}
+                for key in ("file_key", "media_key", "audio_key", "video_key", "file_token", "file_name", "name", "title"):
+                    val = node.get(key)
+                    if val not in (None, ""):
+                        obj[key] = val
+                if obj:
+                    fallback_resources.append((inferred, obj))
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+
+        walk(post or content)
+        merged_text = "\n".join([txt for txt in fallback_texts if txt]).strip()
+        uniq = []
+        seen.clear()
+        for t, obj in fallback_resources:
+            key = self._extract_resource_key(t, obj)
+            if not key:
+                continue
+            sig = f"{t}:{key}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            uniq.append((t, obj))
+        return merged_text, uniq
 
     def _download_attachment(self, chat_id: str, msg_type: str, message_id: str, content: Dict[str, Any]) -> str:
         file_key = self._extract_resource_key(msg_type, content)
