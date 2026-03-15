@@ -51,6 +51,8 @@ API_TOKEN = str(os.getenv("BRIDGE_API_TOKEN", "")).strip()
 TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "21600")))
 PROGRESS_PING_INTERVAL_SEC = max(30, int(os.getenv("BRIDGE_PROGRESS_PING_INTERVAL_SEC", "180")))
 STREAMING_CARD_UPDATE_INTERVAL_SEC = max(2, int(os.getenv("BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC", "5")))
+STREAMING_CARD_PRINT_FREQUENCY_MS = max(1, int(os.getenv("BRIDGE_STREAMING_CARD_PRINT_FREQUENCY_MS", "1")))
+STREAMING_CARD_PRINT_STEP = max(1, int(os.getenv("BRIDGE_STREAMING_CARD_PRINT_STEP", "4096")))
 UPLOAD_ROOT = Path(os.getenv("BRIDGE_UPLOAD_ROOT", str(APP_DIR / "data" / "uploads"))).expanduser()
 if not UPLOAD_ROOT.is_absolute():
     UPLOAD_ROOT = APP_DIR / UPLOAD_ROOT
@@ -962,7 +964,13 @@ class FeishuStreamingCardSession:
             "config": {
                 "streaming_mode": True,
                 "summary": {"content": "处理中..."},
-                "streaming_config": {"print_frequency_ms": {"default": 50}, "print_step": {"default": 1}},
+                # This card replaces the whole status snapshot on each update.
+                # Render each snapshot almost immediately so long-running tasks do
+                # not build up a slow typewriter queue in the Feishu client.
+                "streaming_config": {
+                    "print_frequency_ms": {"default": STREAMING_CARD_PRINT_FREQUENCY_MS},
+                    "print_step": {"default": STREAMING_CARD_PRINT_STEP},
+                },
             },
             "body": {
                 "elements": [
