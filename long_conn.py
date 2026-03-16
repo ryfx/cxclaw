@@ -44,6 +44,12 @@ FEISHU_API = "https://open.feishu.cn/open-apis"
 APP_ID = os.getenv("FEISHU_APP_ID", "").strip()
 APP_SECRET = os.getenv("FEISHU_APP_SECRET", "").strip()
 SINGLE_CHAT_ONLY = str(os.getenv("BRIDGE_SINGLE_CHAT_ONLY", "true")).strip().lower() in {"1", "true", "yes", "on"}
+USER_SESSION_ISOLATION = str(os.getenv("BRIDGE_USER_SESSION_ISOLATION", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 CONTROL_BASE = str(os.getenv("BRIDGE_CONTROL_BASE", "http://127.0.0.1:18788")).strip().rstrip("/")
 API_PREFIX = str(os.getenv("BRIDGE_API_PREFIX", "/appbridge/api")).strip()
@@ -1396,27 +1402,65 @@ class AppServerBotBridge:
             return f"项目已{'创建' if created else '注册'}，但切换失败: {exc}\nname={name}\npath={proj_path}"
         return f"项目已{'创建' if created else '注册'}并切换成功。\nname={name}\npath={proj_path}"
 
-    def _bind_user_chat(self, sender_id: Dict[str, Any], chat_id: str) -> None:
+    def _base_chat_id(self, chat_id: str) -> str:
+        raw = str(chat_id or "").strip()
+        if "::" in raw:
+            raw = raw.split("::", 1)[0].strip()
+        if "@@" in raw:
+            raw = raw.split("@@", 1)[0].strip()
+        return raw
+
+    def _scoped_chat_id(self, chat_id: str, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
+        base = self._base_chat_id(chat_id)
+        if not USER_SESSION_ISOLATION:
+            return base
+        if open_id:
+            return f"{base}@@open:{open_id}"
+        if user_id:
+            return f"{base}@@user:{user_id}"
+        if union_id:
+            return f"{base}@@union:{union_id}"
+        return base
+
+    def _claim_legacy_chat_owner(self, base_chat_id: str, runtime_chat_id: str) -> bool:
+        base = self._base_chat_id(base_chat_id)
+        runtime = str(runtime_chat_id or "").strip()
+        if not USER_SESSION_ISOLATION or not base or not runtime or runtime == base:
+            return False
+        claim_key = f"legacy_claim:{base}"
+        changed = False
+        with self._user_chat_lock:
+            owner = str(self._user_chat_map.get(claim_key) or "").strip()
+            if not owner:
+                owner = runtime
+                self._user_chat_map[claim_key] = owner
+                changed = True
+        if changed:
+            self._persist_user_chat_map()
+        return owner == runtime
+
+    def _bind_user_chat(self, sender_id: Dict[str, Any], chat_id: str, runtime_chat_id: str = "") -> None:
         open_id = str(sender_id.get("open_id") or "").strip()
         user_id = str(sender_id.get("user_id") or "").strip()
         union_id = str(sender_id.get("union_id") or "").strip()
+        mapped_chat = str(runtime_chat_id or chat_id or "").strip()
         changed = False
         with self._user_chat_lock:
             if open_id:
-                if self._user_chat_map.get(open_id) != chat_id:
+                if self._user_chat_map.get(open_id) != mapped_chat:
                     changed = True
-                self._user_chat_map[open_id] = chat_id
-                if self._user_chat_map.get(f"open:{open_id}") != chat_id:
+                self._user_chat_map[open_id] = mapped_chat
+                if self._user_chat_map.get(f"open:{open_id}") != mapped_chat:
                     changed = True
-                self._user_chat_map[f"open:{open_id}"] = chat_id
+                self._user_chat_map[f"open:{open_id}"] = mapped_chat
             if user_id:
-                if self._user_chat_map.get(f"user:{user_id}") != chat_id:
+                if self._user_chat_map.get(f"user:{user_id}") != mapped_chat:
                     changed = True
-                self._user_chat_map[f"user:{user_id}"] = chat_id
+                self._user_chat_map[f"user:{user_id}"] = mapped_chat
             if union_id:
-                if self._user_chat_map.get(f"union:{union_id}") != chat_id:
+                if self._user_chat_map.get(f"union:{union_id}") != mapped_chat:
                     changed = True
-                self._user_chat_map[f"union:{union_id}"] = chat_id
+                self._user_chat_map[f"union:{union_id}"] = mapped_chat
         if changed:
             self._persist_user_chat_map()
 
@@ -1865,8 +1909,15 @@ class AppServerBotBridge:
             current = self.control.status(runtime_key).get("data")
         except Exception:
             current = {}
+        source_chat_id = str(chat_id or "").strip()
+        if USER_SESSION_ISOLATION:
+            base_chat_id = self._base_chat_id(source_chat_id)
+            if base_chat_id and base_chat_id != source_chat_id:
+                if self._claim_legacy_chat_owner(base_chat_id=base_chat_id, runtime_chat_id=source_chat_id):
+                    source_chat_id = base_chat_id
+        source_runtime_key = self._runtime_key(source_chat_id, project) if project else source_chat_id
         try:
-            source = self.control.status(str(chat_id or "")).get("data")
+            source = self.control.status(source_runtime_key).get("data")
         except Exception:
             source = {}
         if cwd:
@@ -2292,21 +2343,22 @@ class AppServerBotBridge:
             ],
         }
 
-    def _handle_text(self, chat_id: str, text: str, sender_open_id: str = "", message_id: str = "") -> None:
+    def _handle_text(self, chat_id: str, text: str, runtime_chat_id: str = "", message_id: str = "") -> None:
         raw = str(text or "").strip()
         if not raw:
             return
-        if self._consume_await_project_name(chat_id):
+        worker_chat_id = str(runtime_chat_id or chat_id or "").strip()
+        if self._consume_await_project_name(worker_chat_id):
             if raw.lower() in {"/cancel", "cancel", "取消"}:
                 self.feishu.send_text(chat_id, "已取消新建项目。")
                 return
-            result = self._create_project_from_name(chat_id=chat_id, raw_name=raw)
+            result = self._create_project_from_name(chat_id=worker_chat_id, raw_name=raw)
             self.feishu.send_text(chat_id, result)
-            self.feishu.send_card(chat_id, self._build_project_manage_card(chat_id))
+            self.feishu.send_card(chat_id, self._build_project_manage_card(worker_chat_id))
             return
 
-        active_project = self._ensure_active_project(chat_id)
-        runtime_key = self._ensure_project_runtime(chat_id, active_project) if active_project else str(chat_id or "")
+        active_project = self._ensure_active_project(worker_chat_id)
+        runtime_key = self._ensure_project_runtime(worker_chat_id, active_project) if active_project else worker_chat_id
         pending_files = self._consume_pending_files(runtime_key)
         prompt, image_paths = self._build_prompt_with_files(raw, pending_files)
         typing_reaction_id = ""
@@ -2431,7 +2483,16 @@ class AppServerBotBridge:
             return
 
         sender_id = sender.get("sender_id") if isinstance(sender.get("sender_id"), dict) else {}
-        self._bind_user_chat(sender_id=sender_id, chat_id=chat_id)
+        sender_open_id = str(sender_id.get("open_id") or "").strip()
+        sender_user_id = str(sender_id.get("user_id") or "").strip()
+        sender_union_id = str(sender_id.get("union_id") or "").strip()
+        runtime_chat_id = self._scoped_chat_id(
+            chat_id=chat_id,
+            open_id=sender_open_id,
+            user_id=sender_user_id,
+            union_id=sender_union_id,
+        )
+        self._bind_user_chat(sender_id=sender_id, chat_id=chat_id, runtime_chat_id=runtime_chat_id)
 
         chat_type = str(message.get("chat_type") or "").strip().lower()
         if SINGLE_CHAT_ONLY and chat_type and chat_type != "p2p":
@@ -2443,16 +2504,15 @@ class AppServerBotBridge:
 
         if msg_type == "text":
             text = str(content.get("text") or "").strip()
-            sender_open_id = str(sender_id.get("open_id") or "").strip()
             message_id = str(message.get("message_id") or "").strip()
-            self._handle_text(chat_id, text, sender_open_id=sender_open_id, message_id=message_id)
+            self._handle_text(chat_id, text, runtime_chat_id=runtime_chat_id, message_id=message_id)
             return
 
         if msg_type in SUPPORTED_ATTACHMENT_TYPES:
             message_id = str(message.get("message_id") or "")
             try:
                 saved = self._download_attachment(chat_id=chat_id, msg_type=msg_type, message_id=message_id, content=content)
-                staged = self._append_pending_file(self._runtime_key(chat_id), saved)
+                staged = self._append_pending_file(self._runtime_key(runtime_chat_id), saved)
                 self.feishu.send_text(
                     chat_id,
                     f"已暂存附件 ({msg_type})\npath={saved}\n当前待处理附件: {staged}\n发送一条文本后将自动带入。",
@@ -2463,7 +2523,6 @@ class AppServerBotBridge:
 
         if msg_type == "post":
             message_id = str(message.get("message_id") or "")
-            sender_open_id = str(sender_id.get("open_id") or "").strip()
             post_text, post_resources = self._extract_post_text_and_resources(content)
 
             if post_resources:
@@ -2475,7 +2534,7 @@ class AppServerBotBridge:
                             message_id=message_id,
                             content=rcontent,
                         )
-                        self._append_pending_file(self._runtime_key(chat_id), saved)
+                        self._append_pending_file(self._runtime_key(runtime_chat_id), saved)
                     except Exception as exc:
                         LOG.warning(
                             "post resource download failed chat_id=%s message_id=%s type=%s err=%s",
@@ -2486,10 +2545,10 @@ class AppServerBotBridge:
                         )
 
             if post_text:
-                self._handle_text(chat_id, post_text, sender_open_id=sender_open_id, message_id=message_id)
+                self._handle_text(chat_id, post_text, runtime_chat_id=runtime_chat_id, message_id=message_id)
                 return
 
-            staged = len(self._list_pending_files(self._runtime_key(chat_id)))
+            staged = len(self._list_pending_files(self._runtime_key(runtime_chat_id)))
             if staged > 0:
                 self.feishu.send_text(chat_id, f"已暂存 {staged} 个 post 附件。请再发一条文本指令继续处理。")
                 return
@@ -2561,11 +2620,16 @@ class AppServerBotBridge:
             LOG.warning("card action dropped: no chat mapping op=%s", op)
             return
 
-        self._bind_user_chat({"open_id": open_id, "user_id": user_id, "union_id": union_id}, chat_id)
+        runtime_chat_id = self._scoped_chat_id(chat_id=chat_id, open_id=open_id, user_id=user_id, union_id=union_id)
+        self._bind_user_chat(
+            {"open_id": open_id, "user_id": user_id, "union_id": union_id},
+            chat_id=chat_id,
+            runtime_chat_id=runtime_chat_id,
+        )
         if op in FINAL_STREAM_CARD_ACTIONS:
             value = dict(value)
             value["_source_message_id"] = source_message_id
-        self._run_card_action(chat_id=chat_id, op=op, value=value)
+        self._run_card_action(chat_id=runtime_chat_id, op=op, value=value)
         if CARD_AUTO_DELETE_ON_ACTION and source_message_id and op not in FINAL_STREAM_CARD_ACTIONS:
             try:
                 self.feishu.delete_message(source_message_id)
@@ -2589,12 +2653,14 @@ class AppServerBotBridge:
         return True
 
     def _run_card_action(self, chat_id: str, op: str, value: Dict[str, Any]) -> None:
-        LOG.info("card action: op=%s chat_id=%s value=%s", op, chat_id, value)
+        runtime_chat_id = str(chat_id or "").strip()
+        reply_chat_id = self._base_chat_id(runtime_chat_id) or runtime_chat_id
+        LOG.info("card action: op=%s runtime_chat_id=%s value=%s", op, runtime_chat_id, value)
 
         if op in FINAL_STREAM_CARD_ACTIONS:
             source_message_id = str(value.get("_source_message_id") or "").strip()
             if not source_message_id:
-                self.feishu.send_text(chat_id, "未找到可更新的结果卡片。")
+                self.feishu.send_text(reply_chat_id, "未找到可更新的结果卡片。")
                 return
             try:
                 if op == "stream_final_expand":
@@ -2607,129 +2673,129 @@ class AppServerBotBridge:
                     ok = self._update_final_stream_message(source_message_id, expanded=True, page_delta=1)
             except Exception as exc:
                 LOG.warning("final stream card action failed message_id=%s op=%s err=%s", source_message_id, op, exc)
-                self.feishu.send_text(chat_id, f"更新结果卡失败: {exc}")
+                self.feishu.send_text(reply_chat_id, f"更新结果卡失败: {exc}")
                 return
             if not ok:
-                self.feishu.send_text(chat_id, "这条结果当前不支持展开，完整内容可到历史页查看。")
+                self.feishu.send_text(reply_chat_id, "这条结果当前不支持展开，完整内容可到历史页查看。")
             return
 
         if op == "open_project_manage":
-            self.feishu.send_card(chat_id, self._build_project_manage_card(chat_id))
+            self.feishu.send_card(reply_chat_id, self._build_project_manage_card(runtime_chat_id))
             return
 
         if op == "open_session_manage":
-            self.feishu.send_card(chat_id, self._build_session_manage_card(chat_id))
+            self.feishu.send_card(reply_chat_id, self._build_session_manage_card(runtime_chat_id))
             return
 
         if op == "project_switch":
             project = str(value.get("project") or "").strip()
             cwd = str(self.projects.get(project) or "").strip()
             if not cwd:
-                self.feishu.send_text(chat_id, f"未知项目: {project}")
+                self.feishu.send_text(reply_chat_id, f"未知项目: {project}")
                 return
             try:
-                self._set_await_project_name(chat_id, False)
-                self._set_active_project(chat_id, project)
-                runtime_key = self._ensure_project_runtime(chat_id, project)
+                self._set_await_project_name(runtime_chat_id, False)
+                self._set_active_project(runtime_chat_id, project)
+                runtime_key = self._ensure_project_runtime(runtime_chat_id, project)
                 status = self.control.status(runtime_key).get("data") if runtime_key else {}
                 thread_id = str((status or {}).get("thread_id") or "").strip()
                 last_turn_id = str(((status or {}).get("state") or {}).get("last_turn_id") or (status or {}).get("last_turn_id") or "").strip()
                 last_user_text = str(((status or {}).get("state") or {}).get("last_user_text") or (status or {}).get("last_user_text") or "").strip()
                 has_history = bool(thread_id or last_turn_id or last_user_text)
                 if has_history:
-                    self.feishu.send_text(chat_id, f"已切换到项目: {project}\n下一条消息会继续该项目最近会话。")
+                    self.feishu.send_text(reply_chat_id, f"已切换到项目: {project}\n下一条消息会继续该项目最近会话。")
                 else:
-                    self.feishu.send_text(chat_id, f"已切换到项目: {project}\n该项目暂时还没有历史会话，下一条消息会新开一条。")
+                    self.feishu.send_text(reply_chat_id, f"已切换到项目: {project}\n该项目暂时还没有历史会话，下一条消息会新开一条。")
             except Exception as exc:
-                self.feishu.send_text(chat_id, f"切换项目失败: {exc}")
+                self.feishu.send_text(reply_chat_id, f"切换项目失败: {exc}")
             return
 
         if op == "project_create_begin":
-            self._set_await_project_name(chat_id, True)
+            self._set_await_project_name(runtime_chat_id, True)
             self.feishu.send_text(
-                chat_id,
+                reply_chat_id,
                 f"请输入新项目名（将创建到 `{self.project_root}`）。\n示例：`my_new_project`\n发送 `/cancel` 可取消。",
             )
             return
 
         if op == "session_interrupt":
             try:
-                result = self.control.interrupt(self._runtime_key(chat_id))
-                self.feishu.send_text(chat_id, _trim(f"中断结果:\n{json.dumps(result, ensure_ascii=False)}", 900))
+                result = self.control.interrupt(self._runtime_key(runtime_chat_id))
+                self.feishu.send_text(reply_chat_id, _trim(f"中断结果:\n{json.dumps(result, ensure_ascii=False)}", 900))
             except Exception as exc:
-                self.feishu.send_text(chat_id, f"中断失败: {exc}")
+                self.feishu.send_text(reply_chat_id, f"中断失败: {exc}")
             return
 
         if op == "session_cmd":
             cmd = str(value.get("cmd") or "").strip()
             if not cmd:
-                self.feishu.send_text(chat_id, "空命令，已忽略")
+                self.feishu.send_text(reply_chat_id, "空命令，已忽略")
                 return
             if cmd == "/status":
-                answer = self._status_text(chat_id)
+                answer = self._status_text(runtime_chat_id)
             else:
-                answer = self._run_session_command(chat_id=chat_id, cmd_text=cmd)
-            self.feishu.smart_send(chat_id, _trim(answer, 3000), title=f"Codex {cmd}")
+                answer = self._run_session_command(chat_id=runtime_chat_id, cmd_text=cmd)
+            self.feishu.smart_send(reply_chat_id, _trim(answer, 3000), title=f"Codex {cmd}")
             return
 
         if op == "session_model_start":
-            answer = self._run_session_command(chat_id=chat_id, cmd_text="/model list")
+            answer = self._run_session_command(chat_id=runtime_chat_id, cmd_text="/model list")
             models = _parse_model_candidates(answer)
             if not models:
-                self.feishu.send_text(chat_id, f"未解析到可用模型，原始返回：\n{_trim(answer, 2000)}")
+                self.feishu.send_text(reply_chat_id, f"未解析到可用模型，原始返回：\n{_trim(answer, 2000)}")
                 return
-            self.feishu.send_card(chat_id, self._build_model_select_card(models))
+            self.feishu.send_card(reply_chat_id, self._build_model_select_card(models))
             return
 
         if op == "session_auth_start":
             resp = self.control.auth_profiles()
             data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
             profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
-            current_profile = str(self._status_data(chat_id).get("auth_profile") or "").strip()
-            self.feishu.send_card(chat_id, self._build_auth_select_card(current_profile=current_profile, profiles=profiles))
+            current_profile = str(self._status_data(runtime_chat_id).get("auth_profile") or "").strip()
+            self.feishu.send_card(reply_chat_id, self._build_auth_select_card(current_profile=current_profile, profiles=profiles))
             return
 
         if op == "session_auth_apply":
             profile = str(value.get("profile") or "").strip()
             try:
-                runtime_key = self._runtime_key(chat_id)
+                runtime_key = self._runtime_key(runtime_chat_id)
                 result = self.control.update_auth_profile(chat_id=runtime_key, profile=profile)
                 data = result.get("data") if isinstance(result.get("data"), dict) else {}
                 self.control.reset(chat_id=runtime_key)
                 label = str(data.get("auth_profile") or "").strip() or "default"
                 identity = str(data.get("auth_identity") or "").strip()
                 suffix = f" ({identity})" if identity else ""
-                self.feishu.send_text(chat_id, f"已切换账号: {label}{suffix}")
+                self.feishu.send_text(reply_chat_id, f"已切换账号: {label}{suffix}")
             except Exception as exc:
-                self.feishu.send_text(chat_id, f"切换账号失败: {exc}")
+                self.feishu.send_text(reply_chat_id, f"切换账号失败: {exc}")
             return
 
         if op == "session_model_pick":
             model = str(value.get("model") or "").strip()
             if not model:
-                self.feishu.send_text(chat_id, "未选择模型")
+                self.feishu.send_text(reply_chat_id, "未选择模型")
                 return
-            self.feishu.send_card(chat_id, self._build_effort_select_card(model))
+            self.feishu.send_card(reply_chat_id, self._build_effort_select_card(model))
             return
 
         if op == "session_model_apply":
             model = str(value.get("model") or "").strip()
             effort = str(value.get("effort") or "").strip().lower()
             if not model or effort not in SUPPORTED_EFFORTS:
-                self.feishu.send_text(chat_id, "模型或推理强度参数无效")
+                self.feishu.send_text(reply_chat_id, "模型或推理强度参数无效")
                 return
 
-            result_model = self._run_session_command(chat_id=chat_id, cmd_text=f"/model use {model}")
-            result_effort = self._run_session_command(chat_id=chat_id, cmd_text=f"/effort {effort}")
-            verify = self._run_session_command(chat_id=chat_id, cmd_text="/status")
+            result_model = self._run_session_command(chat_id=runtime_chat_id, cmd_text=f"/model use {model}")
+            result_effort = self._run_session_command(chat_id=runtime_chat_id, cmd_text=f"/effort {effort}")
+            verify = self._run_session_command(chat_id=runtime_chat_id, cmd_text="/status")
             synced_model = _extract_status_value(verify, "effective_model") or _extract_status_value(verify, "model") or model
             sync_note = ""
             try:
-                self.control.update_config(chat_id=self._runtime_key(chat_id), model=synced_model)
+                self.control.update_config(chat_id=self._runtime_key(runtime_chat_id), model=synced_model)
             except Exception as exc:
                 sync_note = f"\n\nconfig_sync_failed: {exc}"
             self.feishu.smart_send(
-                chat_id,
+                reply_chat_id,
                 text=_trim(
                     "模型切换完成。\n\n"
                     f"/model use {model}\n{result_model}\n\n"
@@ -2741,7 +2807,7 @@ class AppServerBotBridge:
             )
             return
 
-        self.feishu.send_text(chat_id, f"未支持的卡片动作: {op}")
+        self.feishu.send_text(reply_chat_id, f"未支持的卡片动作: {op}")
 
 
 def _message_event_to_payload(data: P2ImMessageReceiveV1) -> Dict[str, Any]:
