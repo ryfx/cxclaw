@@ -1335,7 +1335,7 @@ class AppServerBotBridge:
             return
         changed = False
         with self._user_chat_lock:
-            for k, v in self._user_chat_map.items():
+            for k, v in list(self._user_chat_map.items()):
                 key = str(k or "").strip()
                 chat = str(v or "").strip()
                 if not key or not chat:
