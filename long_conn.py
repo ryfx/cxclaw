@@ -1213,6 +1213,7 @@ class AppServerBotBridge:
 
         self._load_persisted_projects()
         self._load_persisted_user_chat_map()
+        self._bootstrap_legacy_owner_identities()
         self._load_persisted_active_projects()
 
     def handle_event_async(self, payload: Dict[str, Any]) -> None:
@@ -1328,6 +1329,35 @@ class AppServerBotBridge:
             payload = {str(k): str(v) for k, v in self._user_chat_map.items() if str(k).strip() and str(v).strip()}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _bootstrap_legacy_owner_identities(self) -> None:
+        if not USER_SESSION_ISOLATION:
+            return
+        changed = False
+        with self._user_chat_lock:
+            for k, v in self._user_chat_map.items():
+                key = str(k or "").strip()
+                chat = str(v or "").strip()
+                if not key or not chat:
+                    continue
+                if key.startswith("legacy_owner_identity:") or key.startswith("legacy_claim:"):
+                    continue
+                identity = ""
+                if key.startswith("open:") or key.startswith("user:") or key.startswith("union:"):
+                    identity = key
+                elif key.startswith("ou_"):
+                    identity = f"open:{key}"
+                if not identity:
+                    continue
+                base = self._base_chat_id(chat)
+                if not base:
+                    continue
+                owner_key = f"legacy_owner_identity:{base}"
+                if not str(self._user_chat_map.get(owner_key) or "").strip():
+                    self._user_chat_map[owner_key] = identity
+                    changed = True
+        if changed:
+            self._persist_user_chat_map()
 
     def _load_persisted_active_projects(self) -> None:
         path = self.active_projects_store_path
