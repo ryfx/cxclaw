@@ -1410,6 +1410,23 @@ class AppServerBotBridge:
             raw = raw.split("@@", 1)[0].strip()
         return raw
 
+    def _chat_scope_identity(self, chat_id: str) -> str:
+        raw = str(chat_id or "").strip()
+        if "::" in raw:
+            raw = raw.split("::", 1)[0].strip()
+        if "@@" not in raw:
+            return ""
+        return raw.split("@@", 1)[1].strip()
+
+    def _sender_identity(self, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
+        if open_id:
+            return f"open:{open_id}"
+        if user_id:
+            return f"user:{user_id}"
+        if union_id:
+            return f"union:{union_id}"
+        return ""
+
     def _scoped_chat_id(self, chat_id: str, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
         base = self._base_chat_id(chat_id)
         if not USER_SESSION_ISOLATION:
@@ -1428,15 +1445,28 @@ class AppServerBotBridge:
         if not USER_SESSION_ISOLATION or not base or not runtime or runtime == base:
             return False
         claim_key = f"legacy_claim:{base}"
+        owner_key = f"legacy_owner_identity:{base}"
+        runtime_identity = self._chat_scope_identity(runtime)
         changed = False
         with self._user_chat_lock:
+            owner_identity = str(self._user_chat_map.get(owner_key) or "").strip()
+            if not owner_identity and runtime_identity:
+                owner_identity = runtime_identity
+                self._user_chat_map[owner_key] = owner_identity
+                changed = True
+            if owner_identity and runtime_identity and owner_identity != runtime_identity:
+                denied = True
+            else:
+                denied = False
             owner = str(self._user_chat_map.get(claim_key) or "").strip()
-            if not owner:
+            if not denied and not owner:
                 owner = runtime
                 self._user_chat_map[claim_key] = owner
                 changed = True
         if changed:
             self._persist_user_chat_map()
+        if denied:
+            return False
         return owner == runtime
 
     def _bind_user_chat(self, sender_id: Dict[str, Any], chat_id: str, runtime_chat_id: str = "") -> None:
@@ -1444,6 +1474,8 @@ class AppServerBotBridge:
         user_id = str(sender_id.get("user_id") or "").strip()
         union_id = str(sender_id.get("union_id") or "").strip()
         mapped_chat = str(runtime_chat_id or chat_id or "").strip()
+        base_chat = self._base_chat_id(chat_id)
+        identity = self._sender_identity(open_id=open_id, user_id=user_id, union_id=union_id)
         changed = False
         with self._user_chat_lock:
             if open_id:
@@ -1461,6 +1493,11 @@ class AppServerBotBridge:
                 if self._user_chat_map.get(f"union:{union_id}") != mapped_chat:
                     changed = True
                 self._user_chat_map[f"union:{union_id}"] = mapped_chat
+            if base_chat and identity:
+                owner_key = f"legacy_owner_identity:{base_chat}"
+                if not str(self._user_chat_map.get(owner_key) or "").strip():
+                    self._user_chat_map[owner_key] = identity
+                    changed = True
         if changed:
             self._persist_user_chat_map()
 
@@ -1478,7 +1515,9 @@ class AppServerBotBridge:
                 if val:
                     return val
             if SINGLE_CHAT_ONLY:
-                for v in self._user_chat_map.values():
+                for k, v in self._user_chat_map.items():
+                    if str(k).startswith("legacy_owner_identity:"):
+                        continue
                     txt = str(v or "")
                     if txt:
                         return txt
