@@ -2218,18 +2218,28 @@ class AppServerBotBridge:
             "template": "blue",
         }
 
-    def _action_button(self, label: str, value: Dict[str, Any], btn_type: str = "default") -> Dict[str, Any]:
+    def _action_button(
+        self,
+        label: str,
+        value: Dict[str, Any],
+        btn_type: str = "default",
+        project_name: str = "",
+    ) -> Dict[str, Any]:
+        payload = dict(value or {})
+        project = str(project_name or "").strip()
+        if project and not str(payload.get("project") or "").strip():
+            payload["project"] = project
         return {
             "tag": "button",
             "type": btn_type,
             "text": {"tag": "plain_text", "content": label},
-            "value": value,
+            "value": payload,
         }
 
     def _build_project_manage_card(self, chat_id: str) -> Dict[str, Any]:
         status = self._status_data(chat_id)
         cwd = str(status.get("cwd") or "")
-        project_name = self._current_project_name(cwd)
+        project_name = str(status.get("project") or "").strip() or self._current_project_name(cwd)
         lines = [
             f"当前项目: `{project_name or '<custom>'}`",
             f"cwd: `{cwd}`",
@@ -2259,9 +2269,9 @@ class AppServerBotBridge:
             {
                 "tag": "action",
                 "actions": [
-                    self._action_button("新建项目", {"op": "project_create_begin"}, btn_type="primary"),
-                    self._action_button("刷新状态", {"op": "open_project_manage"}),
-                    self._action_button("会话管理", {"op": "open_session_manage"}),
+                    self._action_button("新建项目", {"op": "project_create_begin"}, btn_type="primary", project_name=project_name),
+                    self._action_button("刷新状态", {"op": "open_project_manage"}, project_name=project_name),
+                    self._action_button("会话管理", {"op": "open_session_manage"}, project_name=project_name),
                 ],
             }
         )
@@ -2274,6 +2284,7 @@ class AppServerBotBridge:
 
     def _build_session_manage_card(self, chat_id: str) -> Dict[str, Any]:
         status = self._status_data(chat_id)
+        project_name = str(status.get("project") or "").strip() or self._current_project_name(str(status.get("cwd") or ""))
         tstatus = status.get("thread_status") if isinstance(status.get("thread_status"), dict) else {}
         auth_profile = str(status.get("auth_profile") or "").strip() or "default"
         auth_identity = str(status.get("auth_identity") or "").strip()
@@ -2302,24 +2313,24 @@ class AppServerBotBridge:
             "config": {"wide_screen_mode": True},
             "header": self._card_header("会话管理（Codex 内部命令）"),
             "elements": [
-                {"tag": "markdown", "content": "\n".join(lines)},
+                {"tag": "markdown", "content": (f"项目：`{project_name or '<custom>'}`\n\n" + "\n".join(lines))},
                 {
                     "tag": "action",
                     "actions": [
-                        self._action_button("状态 /status", {"op": "session_cmd", "cmd": "/status"}),
-                        self._action_button("审批 /approvals", {"op": "session_cmd", "cmd": "/approvals"}),
-                        self._action_button("权限 /permissions", {"op": "session_cmd", "cmd": "/permissions"}),
+                        self._action_button("状态 /status", {"op": "session_cmd", "cmd": "/status"}, project_name=project_name),
+                        self._action_button("审批 /approvals", {"op": "session_cmd", "cmd": "/approvals"}, project_name=project_name),
+                        self._action_button("权限 /permissions", {"op": "session_cmd", "cmd": "/permissions"}, project_name=project_name),
                     ],
                 },
                 {
                     "tag": "action",
                     "actions": [
-                        self._action_button("切换模型", {"op": "session_model_start"}, btn_type="primary"),
-                        self._action_button("切换账号", {"op": "session_auth_start"}),
-                        self._action_button("中断", {"op": "session_interrupt"}),
+                        self._action_button("切换模型", {"op": "session_model_start"}, btn_type="primary", project_name=project_name),
+                        self._action_button("切换账号", {"op": "session_auth_start"}, project_name=project_name),
+                        self._action_button("中断", {"op": "session_interrupt"}, project_name=project_name),
                     ],
                 },
-                {"tag": "action", "actions": [self._action_button("项目管理", {"op": "open_project_manage"})]},
+                {"tag": "action", "actions": [self._action_button("项目管理", {"op": "open_project_manage"}, project_name=project_name)]},
                 {
                     "tag": "note",
                     "elements": [
@@ -2332,7 +2343,7 @@ class AppServerBotBridge:
             ],
         }
 
-    def _build_auth_select_card(self, current_profile: str, profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _build_auth_select_card(self, current_profile: str, profiles: List[Dict[str, Any]], project_name: str = "") -> Dict[str, Any]:
         rows: List[Dict[str, Any]] = [
             {
                 "tag": "markdown",
@@ -2351,18 +2362,30 @@ class AppServerBotBridge:
                 rows.append({"tag": "markdown", "content": f"- `{label}`"})
             btn_type = "primary" if (profile or "default") == (current_profile or "default") else "default"
             if valid:
-                buttons.append(self._action_button(label, {"op": "session_auth_apply", "profile": profile}, btn_type=btn_type))
+                buttons.append(
+                    self._action_button(
+                        label,
+                        {"op": "session_auth_apply", "profile": profile},
+                        btn_type=btn_type,
+                        project_name=project_name,
+                    )
+                )
         if buttons:
             for idx in range(0, len(buttons), 3):
                 rows.append({"tag": "action", "actions": buttons[idx : idx + 3]})
-        rows.append({"tag": "action", "actions": [self._action_button("返回会话管理", {"op": "open_session_manage"})]})
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [self._action_button("返回会话管理", {"op": "open_session_manage"}, project_name=project_name)],
+            }
+        )
         return {
             "config": {"wide_screen_mode": True},
             "header": self._card_header("切换账号"),
             "elements": rows,
         }
 
-    def _build_model_select_card(self, models: List[str]) -> Dict[str, Any]:
+    def _build_model_select_card(self, models: List[str], project_name: str = "") -> Dict[str, Any]:
         rows: List[Dict[str, Any]] = [
             {
                 "tag": "markdown",
@@ -2370,24 +2393,27 @@ class AppServerBotBridge:
             }
         ]
         buttons = [
-            self._action_button(m, {"op": "session_model_pick", "model": m}, btn_type="primary")
+            self._action_button(m, {"op": "session_model_pick", "model": m}, btn_type="primary", project_name=project_name)
             for m in models[:12]
         ]
         for idx in range(0, len(buttons), 3):
             rows.append({"tag": "action", "actions": buttons[idx : idx + 3]})
-        rows.append({"tag": "action", "actions": [self._action_button("返回会话管理", {"op": "open_session_manage"})]})
+        rows.append(
+            {"tag": "action", "actions": [self._action_button("返回会话管理", {"op": "open_session_manage"}, project_name=project_name)]}
+        )
         return {
             "config": {"wide_screen_mode": True},
             "header": self._card_header("切换模型 / Step1"),
             "elements": rows,
         }
 
-    def _build_effort_select_card(self, model: str) -> Dict[str, Any]:
+    def _build_effort_select_card(self, model: str, project_name: str = "") -> Dict[str, Any]:
         actions = [
             self._action_button(
                 f"{effort}",
                 {"op": "session_model_apply", "model": model, "effort": effort},
                 btn_type="primary" if effort == "high" else "default",
+                project_name=project_name,
             )
             for effort in SUPPORTED_EFFORTS
         ]
@@ -2724,6 +2750,8 @@ class AppServerBotBridge:
     def _run_card_action(self, chat_id: str, op: str, value: Dict[str, Any]) -> None:
         runtime_chat_id = str(chat_id or "").strip()
         reply_chat_id = self._base_chat_id(runtime_chat_id) or runtime_chat_id
+        target_project = str(value.get("project") or "").strip()
+        scoped_runtime_chat_id = self._runtime_key(runtime_chat_id, target_project) if target_project else runtime_chat_id
         LOG.info("card action: op=%s runtime_chat_id=%s value=%s", op, runtime_chat_id, value)
 
         if op in FINAL_STREAM_CARD_ACTIONS:
@@ -2749,11 +2777,11 @@ class AppServerBotBridge:
             return
 
         if op == "open_project_manage":
-            self.feishu.send_card(reply_chat_id, self._build_project_manage_card(runtime_chat_id))
+            self.feishu.send_card(reply_chat_id, self._build_project_manage_card(scoped_runtime_chat_id))
             return
 
         if op == "open_session_manage":
-            self.feishu.send_card(reply_chat_id, self._build_session_manage_card(runtime_chat_id))
+            self.feishu.send_card(reply_chat_id, self._build_session_manage_card(scoped_runtime_chat_id))
             return
 
         if op == "project_switch":
@@ -2789,7 +2817,7 @@ class AppServerBotBridge:
 
         if op == "session_interrupt":
             try:
-                result = self.control.interrupt(self._runtime_key(runtime_chat_id))
+                result = self.control.interrupt(self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id))
                 self.feishu.send_text(reply_chat_id, _trim(f"中断结果:\n{json.dumps(result, ensure_ascii=False)}", 900))
             except Exception as exc:
                 self.feishu.send_text(reply_chat_id, f"中断失败: {exc}")
@@ -2801,33 +2829,40 @@ class AppServerBotBridge:
                 self.feishu.send_text(reply_chat_id, "空命令，已忽略")
                 return
             if cmd == "/status":
-                answer = self._status_text(runtime_chat_id)
+                answer = self._status_text(scoped_runtime_chat_id)
             else:
-                answer = self._run_session_command(chat_id=runtime_chat_id, cmd_text=cmd)
+                answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=cmd)
             self.feishu.smart_send(reply_chat_id, _trim(answer, 3000), title=f"Codex {cmd}")
             return
 
         if op == "session_model_start":
-            answer = self._run_session_command(chat_id=runtime_chat_id, cmd_text="/model list")
+            answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/model list")
             models = _parse_model_candidates(answer)
             if not models:
                 self.feishu.send_text(reply_chat_id, f"未解析到可用模型，原始返回：\n{_trim(answer, 2000)}")
                 return
-            self.feishu.send_card(reply_chat_id, self._build_model_select_card(models))
+            self.feishu.send_card(reply_chat_id, self._build_model_select_card(models, project_name=target_project))
             return
 
         if op == "session_auth_start":
             resp = self.control.auth_profiles()
             data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
             profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
-            current_profile = str(self._status_data(runtime_chat_id).get("auth_profile") or "").strip()
-            self.feishu.send_card(reply_chat_id, self._build_auth_select_card(current_profile=current_profile, profiles=profiles))
+            current_profile = str(self._status_data(scoped_runtime_chat_id).get("auth_profile") or "").strip()
+            self.feishu.send_card(
+                reply_chat_id,
+                self._build_auth_select_card(
+                    current_profile=current_profile,
+                    profiles=profiles,
+                    project_name=target_project,
+                ),
+            )
             return
 
         if op == "session_auth_apply":
             profile = str(value.get("profile") or "").strip()
             try:
-                runtime_key = self._runtime_key(runtime_chat_id)
+                runtime_key = self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id)
                 result = self.control.update_auth_profile(chat_id=runtime_key, profile=profile)
                 data = result.get("data") if isinstance(result.get("data"), dict) else {}
                 self.control.reset(chat_id=runtime_key)
@@ -2844,7 +2879,7 @@ class AppServerBotBridge:
             if not model:
                 self.feishu.send_text(reply_chat_id, "未选择模型")
                 return
-            self.feishu.send_card(reply_chat_id, self._build_effort_select_card(model))
+            self.feishu.send_card(reply_chat_id, self._build_effort_select_card(model, project_name=target_project))
             return
 
         if op == "session_model_apply":
@@ -2854,13 +2889,16 @@ class AppServerBotBridge:
                 self.feishu.send_text(reply_chat_id, "模型或推理强度参数无效")
                 return
 
-            result_model = self._run_session_command(chat_id=runtime_chat_id, cmd_text=f"/model use {model}")
-            result_effort = self._run_session_command(chat_id=runtime_chat_id, cmd_text=f"/effort {effort}")
-            verify = self._run_session_command(chat_id=runtime_chat_id, cmd_text="/status")
+            result_model = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=f"/model use {model}")
+            result_effort = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=f"/effort {effort}")
+            verify = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/status")
             synced_model = _extract_status_value(verify, "effective_model") or _extract_status_value(verify, "model") or model
             sync_note = ""
             try:
-                self.control.update_config(chat_id=self._runtime_key(runtime_chat_id), model=synced_model)
+                self.control.update_config(
+                    chat_id=self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id),
+                    model=synced_model,
+                )
             except Exception as exc:
                 sync_note = f"\n\nconfig_sync_failed: {exc}"
             self.feishu.smart_send(
