@@ -2150,20 +2150,45 @@ class AppServerBotBridge:
             except Exception as exc:
                 LOG.warning("progress ping failed runtime_key=%s err=%s", runtime_key, exc)
 
+    @staticmethod
+    def _is_recoverable_turn_error(err: str) -> bool:
+        text = str(err or "")
+        patterns = (
+            "disconnected while waiting for turn completion",
+            "Timeout waiting for turn completion",
+            "app-server timeout for method=",
+            "stream disconnected before completion",
+            "app-server is not running",
+            "failed writing to app-server stdin",
+        )
+        return any(p in text for p in patterns)
+
     def _run_turn(self, runtime_key: str, text: str, image_paths: Optional[List[str]] = None) -> str:
-        resp = self.control.turn(chat_id=runtime_key, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
-        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
-        answer = str(data.get("assistant_text") or "").strip()
-        switch_info = data.get("auto_auth_switch") if isinstance(data.get("auto_auth_switch"), dict) else {}
-        if switch_info:
-            from_profile = str(switch_info.get("from") or "").strip() or "default"
-            to_profile = str(switch_info.get("to") or "").strip() or "default"
-            identity = str(switch_info.get("identity") or "").strip()
-            note = f"已自动切换账号：`{from_profile}` -> `{to_profile}`"
-            if identity:
-                note += f" ({identity})"
-            answer = (note + "\n\n" + answer).strip()
-        return answer or "(assistant returned empty text)"
+        for attempt in range(2):
+            try:
+                resp = self.control.turn(chat_id=runtime_key, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
+                data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+                answer = str(data.get("assistant_text") or "").strip()
+                switch_info = data.get("auto_auth_switch") if isinstance(data.get("auto_auth_switch"), dict) else {}
+                if switch_info:
+                    from_profile = str(switch_info.get("from") or "").strip() or "default"
+                    to_profile = str(switch_info.get("to") or "").strip() or "default"
+                    identity = str(switch_info.get("identity") or "").strip()
+                    note = f"已自动切换账号：`{from_profile}` -> `{to_profile}`"
+                    if identity:
+                        note += f" ({identity})"
+                    answer = (note + "\n\n" + answer).strip()
+                return answer or "(assistant returned empty text)"
+            except Exception as exc:
+                if attempt >= 1 or not self._is_recoverable_turn_error(str(exc)):
+                    raise
+                LOG.warning("turn failed with recoverable error, retry after reset runtime_key=%s err=%s", runtime_key, exc)
+                try:
+                    self.control.interrupt(chat_id=runtime_key)
+                except Exception as interrupt_exc:
+                    LOG.warning("turn recover interrupt failed runtime_key=%s err=%s", runtime_key, interrupt_exc)
+                self.control.reset(chat_id=runtime_key)
+        raise RuntimeError("turn failed after retry")
 
     def _run_session_command(self, chat_id: str, cmd_text: str) -> str:
         runtime_key = self._runtime_key(chat_id)
@@ -2178,11 +2203,7 @@ class AppServerBotBridge:
                 return answer
             except Exception as first_exc:
                 first_err = str(first_exc)
-                recoverable = (
-                    "disconnected while waiting for turn completion" in first_err
-                    or "Timeout waiting for turn completion" in first_err
-                    or "app-server timeout for method=" in first_err
-                )
+                recoverable = self._is_recoverable_turn_error(first_err)
                 if not recoverable:
                     return f"会话命令失败: {first_err}"
 
