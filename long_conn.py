@@ -1020,6 +1020,9 @@ class FeishuStreamingCardSession:
         )
         if resp.status_code >= 300:
             raise RuntimeError(f"stream card update failed status={resp.status_code} body={resp.text}")
+        data = resp.json() if resp.text else {}
+        if isinstance(data, dict) and data.get("code") not in (None, 0):
+            raise RuntimeError(f"stream card update feishu err: {data}")
 
     def update(self, text: str) -> None:
         if self.closed or not self.card_id:
@@ -1075,6 +1078,12 @@ class FeishuStreamingCardSession:
             if resp.status_code >= 300:
                 raise RuntimeError(
                     f"stream card close failed status={resp.status_code} body={resp.text}"
+                    + (f"; final_update_err={update_err}" if update_err else "")
+                )
+            data = resp.json() if resp.text else {}
+            if isinstance(data, dict) and data.get("code") not in (None, 0):
+                raise RuntimeError(
+                    f"stream card close feishu err: {data}"
                     + (f"; final_update_err={update_err}" if update_err else "")
                 )
             self.closed = True
@@ -2136,16 +2145,28 @@ class AppServerBotBridge:
         streaming_card: Optional[FeishuStreamingCardSession],
     ) -> None:
         has_streaming_card = streaming_card is not None
-        interval_sec = STREAMING_CARD_UPDATE_INTERVAL_SEC if has_streaming_card else PROGRESS_PING_INTERVAL_SEC
-        while not stop_event.wait(interval_sec):
+        while True:
+            interval_sec = STREAMING_CARD_UPDATE_INTERVAL_SEC if has_streaming_card else PROGRESS_PING_INTERVAL_SEC
+            if stop_event.wait(interval_sec):
+                break
             try:
                 text = self._progress_ping_text(runtime_key=runtime_key, started_at=started_at)
                 if stop_event.is_set():
                     return
                 if has_streaming_card:
                     if streaming_card and streaming_card.is_active():
-                        streaming_card.update(text)
-                    continue
+                        try:
+                            streaming_card.update(text)
+                            continue
+                        except Exception as exc:
+                            LOG.warning(
+                                "stream card update degraded to text runtime_key=%s err=%s",
+                                runtime_key,
+                                exc,
+                            )
+                            has_streaming_card = False
+                    else:
+                        has_streaming_card = False
                 self.feishu.send_text(reply_chat_id, text)
             except Exception as exc:
                 LOG.warning("progress ping failed runtime_key=%s err=%s", runtime_key, exc)
@@ -2537,8 +2558,7 @@ class AppServerBotBridge:
                         streaming_card.close(answer)
                     except Exception as exc:
                         LOG.warning("stream card close failed message_id=%s err=%s", message_id or "<none>", exc)
-                        if not str(streaming_card.message_id or "").strip():
-                            self.feishu.smart_send(chat_id, answer)
+                        self.feishu.smart_send(chat_id, answer)
                 else:
                     self.feishu.smart_send(chat_id, answer)
                 self._send_output_files(chat_id, output_files)
@@ -2553,8 +2573,7 @@ class AppServerBotBridge:
                     try:
                         streaming_card.close(f"处理失败:\n{exc}")
                     except Exception:
-                        if not str(streaming_card.message_id or "").strip():
-                            self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
+                        self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
                 else:
                     self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
             finally:
