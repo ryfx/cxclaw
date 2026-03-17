@@ -6,11 +6,13 @@
 
 - 文本消息直通 Codex。
 - 附件消息自动下载并暂存，供下一轮对话使用。
-- 菜单点击可打开项目/会话管理卡片。
+- 内建零手工文本快捷指令（`/status`、`/stop`、`/last`、`/new`、`/use <project>` 等）。
+- 菜单事件可选启用：启用后可直达高频动作；低频动态项再落卡片。
 - 卡片交互支持项目切换、会话管理、模型切换、账号切换等流程。
 - 长回复使用 Feishu `schema 2.0` markdown 卡片渲染。
 - 支持 OpenClaw 风格的 CardKit streaming card 和消息 reaction typing 状态。
 - 会话在无任务执行且 10 分钟无新消息时自动回收，后续可通过 Codex `resume` 恢复。
+- 支持全局 `soul.md` 记忆：显式偏好声明可自动归纳入库，并在后续对话注入系统上下文。
 
 ## 前置条件
 
@@ -45,15 +47,42 @@
 在飞书应用后台的「事件与回调」中配置：
 
 - 订阅事件：`im.message.receive_v1`
-- 订阅事件：`application.botmenu.v6`
 - 回调配置：`card.action.trigger`
 
-在应用菜单中建议保留以下 `event_key`：
+可选（仅当你要使用飞书“机器人自定义菜单 -> 推送事件”能力时）：
 
-- `menu_project_manage`
-- `menu_session_manage`
+- 订阅事件：`application.botmenu.v6`
+
+默认可以完全不配置菜单，直接使用文本快捷指令。
+
+如果配置了应用菜单，建议保留以下 `event_key`：
+
+- `menu_status`（直出状态）
+- `menu_interrupt`（中断当前任务）
+- `menu_project_last`（切到最近项目）
+- `menu_project_create`（进入新建项目流程）
+- `menu_project_manage`（项目列表卡片，低频兜底）
+- `menu_session_manage`（会话管理卡片，低频兜底）
+- `menu_auth_manage`（账号选择卡片）
+- `menu_model_manage`（模型选择卡片）
 
 菜单键映射通过 `.env` 里的 `BRIDGE_MENU_ACTIONS_JSON` 配置。
+
+## 零手工快捷指令
+
+无需飞书后台手配菜单，可直接在会话中输入：
+
+- `/status` 或 `状态`
+- `/stop` 或 `/interrupt` 或 `中断`
+- `/last` 或 `最近项目`
+- `/new` 或 `新建项目`（进入新建流程）
+- `/new <项目名>`（直接创建并切换）
+- `/use <项目名>` 或 `切换项目 <项目名>`
+- `/project`（项目管理）
+- `/session`（会话管理）
+- `/auth`（账号管理）
+- `/model`（模型管理）
+- `/menu` 或 `/help`（查看快捷指令）
 
 建议开通的应用身份权限：
 
@@ -104,6 +133,13 @@
 - 输出文件数量上限：`BRIDGE_OUTPUT_FILE_MAX_COUNT=0`
 - 输出文件大小上限：`BRIDGE_OUTPUT_FILE_MAX_SIZE_MB=30`
 - 输出文件扫描年龄：`BRIDGE_OUTPUT_FILE_MAX_AGE_SEC=3600`
+- 全局记忆开关：`BRIDGE_SOUL_ENABLED=true`
+- 全局记忆文件：`BRIDGE_SOUL_PATH=./soul.md`
+- 记忆注入长度上限：`BRIDGE_SOUL_MAX_PROMPT_CHARS=6000`
+- 全局记忆条目上限：`BRIDGE_SOUL_MAX_BULLETS=200`
+- 飞书名称缓存 TTL：`BRIDGE_DISPLAY_NAME_CACHE_TTL_SEC=21600`
+- 文本快捷指令开关：`BRIDGE_TEXT_SHORTCUTS_ENABLED=true`
+- 机器人名兜底：`BRIDGE_BOT_DISPLAY_NAME=...`
 - 默认文件回传 MCP 名称：`BRIDGE_MCP_SERVER_NAME=feishu-bridge-files`
 - MCP 文件允许目录：`BRIDGE_MCP_FILE_ALLOWED_DIRS=/root/bridgespace/projects`
 - MCP 文件大小上限：`BRIDGE_MCP_FILE_MAX_SIZE_MB=30`
