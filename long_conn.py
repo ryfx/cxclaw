@@ -4,7 +4,7 @@
 This process handles Feishu events and forwards actions to local control API.
 Interaction model:
 - Natural language text messages -> direct Codex turn.
-- Menu events -> direct actions (cards only for low-frequency dynamic choices).
+- Menu events -> interactive cards.
 - Card actions -> multi-step state-machine actions.
 """
 
@@ -121,58 +121,10 @@ OUTPUT_FILE_MAX_SIZE_MB = min(
 )
 OUTPUT_FILE_MAX_AGE_SEC = max(60, int(os.getenv("BRIDGE_OUTPUT_FILE_MAX_AGE_SEC", "3600")))
 OUTPUT_FILE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".txt"}
-SOUL_ENABLED = str(os.getenv("BRIDGE_SOUL_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
-SOUL_PATH = Path(os.getenv("BRIDGE_SOUL_PATH", str(APP_DIR / "soul.md"))).expanduser()
-if not SOUL_PATH.is_absolute():
-    SOUL_PATH = APP_DIR / SOUL_PATH
-SOUL_PATH = SOUL_PATH.resolve()
-SOUL_MAX_PROMPT_CHARS = max(800, int(os.getenv("BRIDGE_SOUL_MAX_PROMPT_CHARS", "6000")))
-SOUL_MAX_BULLETS = max(10, int(os.getenv("BRIDGE_SOUL_MAX_BULLETS", "200")))
-DISPLAY_NAME_CACHE_TTL_SEC = max(300, int(os.getenv("BRIDGE_DISPLAY_NAME_CACHE_TTL_SEC", "21600")))
-TEXT_SHORTCUTS_ENABLED = str(os.getenv("BRIDGE_TEXT_SHORTCUTS_ENABLED", "true")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
 DEFAULT_MENU_ACTIONS = {
-    # Fast-path menu actions (prefer direct execution over multi-card hops).
-    "menu_status": "session_status",
-    "menu_interrupt": "session_interrupt",
-    "menu_project_last": "project_switch_last",
-    "menu_project_create": "project_create_begin",
-    # Card fallback entries (for low-frequency dynamic selections).
     "menu_project_manage": "open_project_manage",
     "menu_session_manage": "open_session_manage",
-    "menu_auth_manage": "session_auth_start",
-    "menu_model_manage": "session_model_start",
-}
-
-TEXT_SHORTCUT_ACTIONS = {
-    "/status": "session_status",
-    "状态": "session_status",
-    "会话状态": "session_status",
-    "/stop": "session_interrupt",
-    "/interrupt": "session_interrupt",
-    "中断": "session_interrupt",
-    "停止": "session_interrupt",
-    "/last": "project_switch_last",
-    "/project last": "project_switch_last",
-    "最近项目": "project_switch_last",
-    "切到最近项目": "project_switch_last",
-    "/new": "project_create_begin",
-    "/project new": "project_create_begin",
-    "新建项目": "project_create_begin",
-    "/project": "open_project_manage",
-    "项目管理": "open_project_manage",
-    "/session": "open_session_manage",
-    "会话管理": "open_session_manage",
-    "/auth": "session_auth_start",
-    "账号管理": "session_auth_start",
-    "账户管理": "session_auth_start",
-    "/model": "session_model_start",
-    "模型管理": "session_model_start",
 }
 
 DEFAULT_PROJECTS = {
@@ -195,161 +147,12 @@ FINAL_STREAM_CARD_ACTIONS = {
 _FINAL_STREAM_CARD_STATE_LOCK = threading.Lock()
 _FINAL_STREAM_CARD_STATE: Dict[str, Dict[str, Any]] = {}
 _REPLY_CONTEXT_FILE_LOCK = threading.Lock()
-_SOUL_FILE_LOCK = threading.Lock()
-
-_SOUL_DECLARATION_PATTERNS = (
-    re.compile(r"^\s*/soul\s+([\s\S]+)$", re.I),
-    re.compile(r"^\s*(?:偏好|原则|记住|长期偏好|全局偏好|全局要求|长期要求)\s*[:：]\s*([\s\S]+)$", re.I),
-)
 
 
 def _safe_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
-
-
-def _now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _default_soul_markdown() -> str:
-    lines = [
-        "# Soul Memory",
-        "",
-        "全局用户偏好与原则（与具体项目无关）。",
-        f"Updated at: {_now_text()}",
-        "",
-        "## Stable Preferences",
-        "- 回复风格要有温度：先理解用户处境，再给出清晰可执行建议。",
-        "- 回复时优先结合用户上下文，避免模板化空话。",
-        "",
-        "## Notes",
-        "- 只记录长期有效、跨项目的偏好和原则。",
-        "- 不记录临时任务细节和敏感凭据。",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def _ensure_soul_file() -> None:
-    if not SOUL_ENABLED:
-        return
-    if SOUL_PATH.exists():
-        return
-    SOUL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SOUL_PATH.write_text(_default_soul_markdown(), encoding="utf-8")
-
-
-def _read_soul_markdown(limit_chars: int = SOUL_MAX_PROMPT_CHARS) -> str:
-    if not SOUL_ENABLED:
-        return ""
-    _ensure_soul_file()
-    try:
-        raw = SOUL_PATH.read_text(encoding="utf-8")
-    except Exception:
-        return ""
-    txt = str(raw or "").strip()
-    if len(txt) > limit_chars:
-        txt = txt[: max(200, limit_chars - 32)] + "\n...<truncated>"
-    return txt
-
-
-def _extract_soul_items(markdown_text: str) -> List[str]:
-    lines = str(markdown_text or "").splitlines()
-    in_section = False
-    items: List[str] = []
-    for line in lines:
-        stripped = str(line or "").strip()
-        if stripped.startswith("## "):
-            in_section = stripped.lower() == "## stable preferences"
-            continue
-        if (not in_section) or (not stripped.startswith("- ")):
-            continue
-        item = stripped[2:].strip()
-        if not item or item in {"（暂未记录）", "(empty)"}:
-            continue
-        items.append(item)
-    return items
-
-
-def _normalize_soul_items(items: List[str]) -> List[str]:
-    out: List[str] = []
-    seen: set[str] = set()
-    for raw in items:
-        txt = re.sub(r"\s+", " ", str(raw or "").strip()).strip(" -")
-        if not txt:
-            continue
-        key = txt.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(txt[:280])
-        if len(out) >= SOUL_MAX_BULLETS:
-            break
-    return out
-
-
-def _write_soul_items(items: List[str]) -> None:
-    merged = _normalize_soul_items(items)
-    lines = [
-        "# Soul Memory",
-        "",
-        "全局用户偏好与原则（与具体项目无关）。",
-        f"Updated at: {_now_text()}",
-        "",
-        "## Stable Preferences",
-    ]
-    if merged:
-        lines.extend([f"- {item}" for item in merged])
-    else:
-        lines.append("- （暂未记录）")
-    lines.extend(
-        [
-            "",
-            "## Notes",
-            "- 只记录长期有效、跨项目的偏好和原则。",
-            "- 不记录临时任务细节和敏感凭据。",
-            "",
-        ]
-    )
-    SOUL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SOUL_PATH.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _upsert_soul_items(new_items: List[str]) -> int:
-    if not SOUL_ENABLED:
-        return 0
-    with _SOUL_FILE_LOCK:
-        _ensure_soul_file()
-        existing_md = _read_soul_markdown(limit_chars=200000)
-        existing = _extract_soul_items(existing_md)
-        before = _normalize_soul_items(existing)
-        merged = _normalize_soul_items(before + list(new_items or []))
-        _write_soul_items(merged)
-        return max(0, len(merged) - len(before))
-
-
-def _extract_json_object(raw_text: str) -> Dict[str, Any]:
-    text = str(raw_text or "").strip()
-    if not text:
-        return {}
-    candidates: List[str] = [text]
-    fence = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text, re.I)
-    if fence:
-        candidates.append(str(fence.group(1) or "").strip())
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        candidates.append(text[start : end + 1])
-    for candidate in candidates:
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    return {}
 
 
 def _split_text(text: str, max_len: int = 1500) -> List[str]:
@@ -391,10 +194,6 @@ def _trim(text: str, max_len: int = 1200) -> str:
     if len(txt) <= max_len:
         return txt
     return txt[: max_len - 16] + "\n...<truncated>"
-
-
-def _normalize_shortcut(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "").strip())
 
 
 def _parse_content_json(raw: Any) -> Dict[str, Any]:
@@ -877,61 +676,6 @@ class FeishuClient:
                 raise RuntimeError("Feishu token response missing tenant_access_token")
             self._token_expire_at = now + int(data.get("expire", 7200)) - 60
             return self._token
-
-    def _api_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        token = self._tenant_access_token()
-        headers = {"Authorization": f"Bearer {token}"}
-        url = f"{FEISHU_API}{str(path or '').strip()}"
-        resp = requests.get(url, headers=headers, params=dict(params or {}), timeout=20)
-        if resp.status_code >= 300:
-            raise RuntimeError(f"feishu get failed path={path} status={resp.status_code} body={resp.text}")
-        data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"feishu get err path={path} body={data}")
-        body = data.get("data")
-        return dict(body) if isinstance(body, dict) else {}
-
-    def get_application_name(self) -> str:
-        if not self.app_id:
-            return ""
-        try:
-            data = self._api_get(f"/application/v6/applications/{self.app_id}", params={"lang": "zh_cn"})
-            app = data.get("app") if isinstance(data.get("app"), dict) else {}
-            return str(app.get("app_name") or "").strip()
-        except Exception:
-            return ""
-
-    def get_chat_name(self, chat_id: str) -> str:
-        cid = str(chat_id or "").strip()
-        if not cid:
-            return ""
-        try:
-            data = self._api_get(f"/im/v1/chats/{cid}")
-            return str(data.get("name") or "").strip()
-        except Exception:
-            return ""
-
-    def get_user_display_name(self, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
-        probes: List[Tuple[str, str]] = []
-        if open_id:
-            probes.append(("open_id", str(open_id).strip()))
-        if user_id:
-            probes.append(("user_id", str(user_id).strip()))
-        if union_id:
-            probes.append(("union_id", str(union_id).strip()))
-        for id_type, uid in probes:
-            if not uid:
-                continue
-            try:
-                data = self._api_get(f"/contact/v3/users/{uid}", params={"user_id_type": id_type})
-            except Exception:
-                continue
-            user = data.get("user") if isinstance(data.get("user"), dict) else {}
-            for key in ("name", "nickname", "en_name"):
-                value = str(user.get(key) or "").strip()
-                if value:
-                    return value
-        return ""
 
     def send_text_by_receive_id(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
         token = self._tenant_access_token()
@@ -1475,17 +1219,11 @@ class AppServerBotBridge:
         self._await_project_name: Dict[str, bool] = {}
         self._active_project_lock = threading.Lock()
         self._active_project: Dict[str, str] = {}
-        self._display_name_cache_lock = threading.Lock()
-        self._display_name_cache: Dict[str, Dict[str, Any]] = {}
-        self._chat_name_cache: Dict[str, Dict[str, Any]] = {}
-        self._bot_name_cache: Dict[str, Any] = {"name": "", "expire_at": 0.0}
-        self._soul_update_lock = threading.Lock()
 
         self._load_persisted_projects()
         self._load_persisted_user_chat_map()
         self._bootstrap_legacy_owner_identities()
         self._load_persisted_active_projects()
-        _ensure_soul_file()
 
     def handle_event_async(self, payload: Dict[str, Any]) -> None:
         threading.Thread(target=self._handle_event_safe, args=(payload,), daemon=True).start()
@@ -1824,138 +1562,6 @@ class AppServerBotBridge:
                         return txt
         return ""
 
-    def _resolve_bot_display_name(self) -> str:
-        fallback = str(os.getenv("BRIDGE_BOT_DISPLAY_NAME", "")).strip()
-        now = time.time()
-        with self._display_name_cache_lock:
-            cached = self._bot_name_cache
-            if str(cached.get("name") or "").strip() and float(cached.get("expire_at") or 0) > now:
-                return str(cached.get("name") or "").strip()
-        name = str(self.feishu.get_application_name() or "").strip() or fallback
-        with self._display_name_cache_lock:
-            self._bot_name_cache = {"name": name, "expire_at": now + DISPLAY_NAME_CACHE_TTL_SEC}
-        return name
-
-    def _resolve_chat_display_name(self, chat_id: str) -> str:
-        cid = str(chat_id or "").strip()
-        if not cid:
-            return ""
-        now = time.time()
-        with self._display_name_cache_lock:
-            cached = self._chat_name_cache.get(cid) if isinstance(self._chat_name_cache.get(cid), dict) else None
-            if cached and float(cached.get("expire_at") or 0) > now:
-                return str(cached.get("name") or "").strip()
-        name = str(self.feishu.get_chat_name(cid) or "").strip()
-        with self._display_name_cache_lock:
-            self._chat_name_cache[cid] = {"name": name, "expire_at": now + DISPLAY_NAME_CACHE_TTL_SEC}
-        return name
-
-    def _resolve_sender_display_name(self, sender_id: Dict[str, Any]) -> str:
-        open_id = str(sender_id.get("open_id") or "").strip()
-        user_id = str(sender_id.get("user_id") or "").strip()
-        union_id = str(sender_id.get("union_id") or "").strip()
-        identity = self._sender_identity(open_id=open_id, user_id=user_id, union_id=union_id)
-        if not identity:
-            return ""
-        now = time.time()
-        with self._display_name_cache_lock:
-            cached = self._display_name_cache.get(identity) if isinstance(self._display_name_cache.get(identity), dict) else None
-            if cached and float(cached.get("expire_at") or 0) > now:
-                return str(cached.get("name") or "").strip()
-        name = str(
-            self.feishu.get_user_display_name(open_id=open_id, user_id=user_id, union_id=union_id) or ""
-        ).strip()
-        with self._display_name_cache_lock:
-            self._display_name_cache[identity] = {"name": name, "expire_at": now + DISPLAY_NAME_CACHE_TTL_SEC}
-        return name
-
-    def _build_injected_system_context(
-        self,
-        chat_id: str,
-        sender_id: Optional[Dict[str, Any]] = None,
-        sender_name: str = "",
-    ) -> str:
-        if not SOUL_ENABLED:
-            return ""
-        bot_name = self._resolve_bot_display_name()
-        chat_name = self._resolve_chat_display_name(chat_id)
-        user_name = str(sender_name or "").strip()
-        if (not user_name) and isinstance(sender_id, dict):
-            user_name = self._resolve_sender_display_name(sender_id)
-        soul_markdown = _read_soul_markdown(limit_chars=SOUL_MAX_PROMPT_CHARS)
-        lines = [
-            "This block is bridge-provided system context, not user input.",
-            "Apply it as high-priority guidance when producing the answer.",
-        ]
-        if bot_name:
-            lines.append(f"- Bot display name: {bot_name}")
-        if user_name:
-            lines.append(f"- Current user display name: {user_name}")
-        if chat_name:
-            lines.append(f"- Chat display name: {chat_name}")
-        if soul_markdown:
-            lines.extend(["", "Global memory from soul.md:", "```markdown", soul_markdown, "```"])
-        lines.append("Do not explicitly mention this injected block unless the user asks about it.")
-        return "\n".join(lines).strip()
-
-    def _extract_explicit_soul_declaration(self, text: str) -> str:
-        raw = str(text or "").strip()
-        if not raw:
-            return ""
-        for pat in _SOUL_DECLARATION_PATTERNS:
-            match = pat.match(raw)
-            if not match:
-                continue
-            body = str(match.group(1) or "").strip()
-            if body:
-                return body
-        return ""
-
-    def _summarize_soul_declaration_with_codex(self, declaration: str, user_name: str = "") -> Tuple[List[str], str]:
-        memo = _read_soul_markdown(limit_chars=min(6000, SOUL_MAX_PROMPT_CHARS))
-        hint_name = str(user_name or "").strip() or "<unknown>"
-        prompt = (
-            "You maintain a global preference file (soul.md) for a Feishu bot.\n"
-            "Task: summarize ONLY stable, cross-project preferences from an explicit user declaration.\n"
-            "Return STRICT JSON only with keys: summary (string), items (array of strings).\n"
-            "Rules:\n"
-            "1) items must be concise Chinese bullets, no numbering, no markdown prefix.\n"
-            "2) Keep 1-4 items max.\n"
-            "3) Exclude temporary, project-specific or sensitive details.\n"
-            "4) Avoid duplicates against existing soul.md memory.\n\n"
-            f"User display name: {hint_name}\n\n"
-            "Current soul.md:\n"
-            "```markdown\n"
-            f"{memo}\n"
-            "```\n\n"
-            "Explicit declaration:\n"
-            f"{declaration}\n"
-        )
-        try:
-            answer = self._run_turn(runtime_key="__bridge_soul_maintainer__", text=prompt, image_paths=[])
-        except Exception as exc:
-            LOG.warning("soul summarize via codex failed: %s", exc)
-            return [], ""
-        obj = _extract_json_object(answer)
-        items_raw = obj.get("items") if isinstance(obj.get("items"), list) else []
-        items = [str(x).strip() for x in items_raw if str(x).strip()]
-        summary = str(obj.get("summary") or "").strip()
-        return _normalize_soul_items(items)[:4], summary
-
-    def _record_soul_declaration(self, declaration: str, user_name: str = "") -> Dict[str, Any]:
-        body = str(declaration or "").strip()
-        if not body:
-            return {"added": 0, "items": [], "summary": ""}
-        with self._soul_update_lock:
-            items, summary = self._summarize_soul_declaration_with_codex(body, user_name=user_name)
-            if not items:
-                fallback = _normalize_soul_items([body[:220]])
-                items = fallback[:1]
-                if not summary:
-                    summary = "已按原文兜底记录。"
-            added = _upsert_soul_items(items)
-            return {"added": int(added), "items": items, "summary": summary}
-
     def _append_pending_file(self, chat_id: str, file_path: str) -> int:
         with self._pending_files_lock:
             items = self._pending_files.setdefault(str(chat_id), [])
@@ -2015,40 +1621,22 @@ class AppServerBotBridge:
         lines.append("发送任意文本后，这些路径会自动带入下一轮对话。")
         return "\n".join(lines)
 
-    def _build_prompt_with_files(self, user_text: str, files: List[str], system_context: str = "") -> Tuple[str, List[str]]:
+    def _build_prompt_with_files(self, user_text: str, files: List[str]) -> Tuple[str, List[str]]:
+        if not files:
+            return user_text, []
+
         valid_files = [str(p) for p in files if str(p).strip()]
         image_paths = [p for p in valid_files if _is_image_path(p) and Path(p).exists()]
-        sections: List[str] = []
-        ctx = str(system_context or "").strip()
-        if ctx:
-            sections.append(
-                "\n".join(
-                    [
-                        "[Bridge Injected System Context]",
-                        ctx,
-                    ]
-                ).strip()
-            )
-        if valid_files:
-            sections.append(
-                "\n".join(
-                    [
-                        "User attached files. Local paths:",
-                        *[f"- {p}" for p in valid_files],
-                        "Use these files as context for this request.",
-                        "If a file is non-text/binary, explain how to inspect it first.",
-                    ]
-                ).strip()
-            )
-        sections.append(
-            "\n".join(
-                [
-                    "User request:",
-                    str(user_text or ""),
-                ]
-            ).strip()
-        )
-        return "\n\n".join([s for s in sections if str(s).strip()]).strip(), image_paths
+        lines = [
+            "User attached files. Local paths:",
+            *[f"- {p}" for p in valid_files],
+            "Use these files as context for this request.",
+            "If a file is non-text/binary, explain how to inspect it first.",
+            "",
+            "User request:",
+            user_text,
+        ]
+        return "\n".join(lines).strip(), image_paths
 
     def _extract_output_files(self, answer_text: str, exclude_paths: Optional[List[str]] = None) -> List[Path]:
         if not OUTPUT_FILE_AUTO_SEND:
@@ -2391,48 +1979,6 @@ class AppServerBotBridge:
             self._set_active_project(chat_id, first)
         return first
 
-    def _preferred_active_project(self, chat_id: str) -> str:
-        """Resolve a project quickly from local state without remote status probing."""
-        raw_chat = str(chat_id or "").strip()
-        if "::" in raw_chat:
-            _, scoped_project = raw_chat.split("::", 1)
-            scoped_project = str(scoped_project or "").strip()
-            if scoped_project:
-                with self._projects_lock:
-                    if scoped_project in self.projects:
-                        return scoped_project
-            raw_chat = raw_chat.split("::", 1)[0].strip()
-
-        self._load_persisted_projects()
-        active = self._get_active_project(raw_chat)
-        if active:
-            with self._projects_lock:
-                if active in self.projects:
-                    return active
-            self._set_active_project(raw_chat, "")
-        recent = self._latest_project_runtime(raw_chat)
-        if recent:
-            self._set_active_project(raw_chat, recent)
-            return recent
-        with self._projects_lock:
-            first = next(iter(self.projects.keys()), "")
-        if first:
-            self._set_active_project(raw_chat, first)
-        return first
-
-    def _switch_active_project(self, runtime_chat_id: str, reply_chat_id: str, project: str) -> None:
-        project_name = str(project or "").strip()
-        cwd = str(self.projects.get(project_name) or "").strip()
-        if not cwd:
-            self.feishu.send_text(reply_chat_id, f"未知项目: {project_name}")
-            return
-        try:
-            self._set_await_project_name(runtime_chat_id, False)
-            self._set_active_project(runtime_chat_id, project_name)
-            self.feishu.send_text(reply_chat_id, f"已切换到项目: {project_name}\n下一条消息将在该项目上下文执行。")
-        except Exception as exc:
-            self.feishu.send_text(reply_chat_id, f"切换项目失败: {exc}")
-
     def _ensure_project_runtime(self, chat_id: str, project_name: str) -> str:
         project = str(project_name or "").strip()
         cwd = str(self.projects.get(project) or "").strip()
@@ -2733,11 +2279,13 @@ class AppServerBotBridge:
         }
 
     def _build_project_manage_card(self, chat_id: str) -> Dict[str, Any]:
-        project_name = self._preferred_active_project(chat_id)
-        cwd = str(self.projects.get(project_name) or "").strip()
+        status = self._status_data(chat_id)
+        cwd = str(status.get("cwd") or "")
+        project_name = str(status.get("project") or "").strip() or self._current_project_name(cwd)
         lines = [
             f"当前项目: `{project_name or '<custom>'}`",
             f"cwd: `{cwd}`",
+            f"thread: `{status.get('thread_id') or '<none>'}`",
         ]
         if self._is_await_project_name(chat_id):
             lines.append("新建项目流程中：请直接发送项目名，或发送 `/cancel` 取消。")
@@ -2765,6 +2313,7 @@ class AppServerBotBridge:
                 "actions": [
                     self._action_button("新建项目", {"op": "project_create_begin"}, btn_type="primary", project_name=project_name),
                     self._action_button("刷新状态", {"op": "open_project_manage"}, project_name=project_name),
+                    self._action_button("会话管理", {"op": "open_session_manage"}, project_name=project_name),
                 ],
             }
         )
@@ -2823,12 +2372,13 @@ class AppServerBotBridge:
                         self._action_button("中断", {"op": "session_interrupt"}, project_name=project_name),
                     ],
                 },
+                {"tag": "action", "actions": [self._action_button("项目管理", {"op": "open_project_manage"}, project_name=project_name)]},
                 {
                     "tag": "note",
                     "elements": [
                         {
                             "tag": "plain_text",
-                            "content": "注：高频操作建议走飞书菜单快捷项；本卡片用于低频动态操作。",
+                            "content": "注：文本输入会直通 Codex；斜杠命令建议通过本卡片触发。",
                         }
                     ],
                 },
@@ -2881,7 +2431,7 @@ class AppServerBotBridge:
         rows: List[Dict[str, Any]] = [
             {
                 "tag": "markdown",
-                "content": "请选择要切换的模型。\n\n点击后将直接应用（默认 `effort=high`）。",
+                "content": "步骤 1/3：选择模型\n\n请选择要切换的模型。",
             }
         ]
         buttons = [
@@ -2895,7 +2445,7 @@ class AppServerBotBridge:
         )
         return {
             "config": {"wide_screen_mode": True},
-            "header": self._card_header("切换模型"),
+            "header": self._card_header("切换模型 / Step1"),
             "elements": rows,
         }
 
@@ -2930,121 +2480,24 @@ class AppServerBotBridge:
             ],
         }
 
-    def _shortcut_help_text(self) -> str:
-        return (
-            "可直接输入这些快捷指令（无需飞书后台手配菜单）：\n"
-            "- /status 或 状态\n"
-            "- /stop 或 /interrupt 或 中断\n"
-            "- /last 或 最近项目\n"
-            "- /new 或 新建项目（进入新建流程）\n"
-            "- /new <项目名>（直接创建并切换）\n"
-            "- /use <项目名> 或 切换项目 <项目名>\n"
-            "- /project（项目管理）\n"
-            "- /session（会话管理）\n"
-            "- /auth（账号管理）\n"
-            "- /model（模型管理）\n"
-            "- /menu 或 /help（查看本帮助）"
-        )
-
-    def _try_handle_text_shortcut(self, runtime_chat_id: str, reply_chat_id: str, raw: str) -> str:
-        if not TEXT_SHORTCUTS_ENABLED:
-            return ""
-        normalized = _normalize_shortcut(raw)
-        if not normalized:
-            return ""
-        lowered = normalized.lower()
-
-        if lowered in {"/menu", "/help", "帮助", "快捷菜单", "快捷指令"}:
-            self.feishu.send_text(reply_chat_id, self._shortcut_help_text())
-            return "help"
-
-        m = re.match(r"^/(?:new|project\s+new)\s+(.+)$", normalized, re.I)
-        if not m:
-            m = re.match(r"^(?:新建项目)\s+(.+)$", normalized)
-        if m:
-            result = self._create_project_from_name(chat_id=runtime_chat_id, raw_name=str(m.group(1) or "").strip())
-            self.feishu.send_text(reply_chat_id, result)
-            self.feishu.send_card(reply_chat_id, self._build_project_manage_card(runtime_chat_id))
-            return "project_create_direct"
-
-        m = re.match(r"^/(?:use|project\s+use)\s+(.+)$", normalized, re.I)
-        if not m:
-            m = re.match(r"^(?:切换项目|项目切换)\s+(.+)$", normalized)
-        if m:
-            project = str(m.group(1) or "").strip()
-            if not project:
-                self.feishu.send_text(reply_chat_id, "项目名为空，请补充后重试。")
-                return "project_switch"
-            self._switch_active_project(runtime_chat_id=runtime_chat_id, reply_chat_id=reply_chat_id, project=project)
-            return "project_switch"
-
-        op = TEXT_SHORTCUT_ACTIONS.get(lowered) or TEXT_SHORTCUT_ACTIONS.get(normalized)
-        if not op:
-            return ""
-        self._run_card_action(chat_id=runtime_chat_id, op=op, value={})
-        return op
-
-    def _handle_text(
-        self,
-        chat_id: str,
-        text: str,
-        runtime_chat_id: str = "",
-        message_id: str = "",
-        sender_id: Optional[Dict[str, Any]] = None,
-        sender_name: str = "",
-    ) -> None:
+    def _handle_text(self, chat_id: str, text: str, runtime_chat_id: str = "", message_id: str = "") -> None:
         raw = str(text or "").strip()
         if not raw:
             return
         worker_chat_id = str(runtime_chat_id or chat_id or "").strip()
-        if self._is_await_project_name(worker_chat_id):
+        if self._consume_await_project_name(worker_chat_id):
             if raw.lower() in {"/cancel", "cancel", "取消"}:
-                self._set_await_project_name(worker_chat_id, False)
                 self.feishu.send_text(chat_id, "已取消新建项目。")
                 return
-            shortcut = self._try_handle_text_shortcut(runtime_chat_id=worker_chat_id, reply_chat_id=chat_id, raw=raw)
-            if shortcut:
-                if shortcut in {"project_create_direct", "project_switch"}:
-                    self._set_await_project_name(worker_chat_id, False)
-                return
-            self._set_await_project_name(worker_chat_id, False)
             result = self._create_project_from_name(chat_id=worker_chat_id, raw_name=raw)
             self.feishu.send_text(chat_id, result)
             self.feishu.send_card(chat_id, self._build_project_manage_card(worker_chat_id))
             return
 
-        sender_meta = sender_id if isinstance(sender_id, dict) else {}
-        current_user_name = str(sender_name or "").strip()
-        if (not current_user_name) and sender_meta:
-            current_user_name = self._resolve_sender_display_name(sender_meta)
-
-        soul_decl = self._extract_explicit_soul_declaration(raw)
-        if soul_decl:
-            rec = self._record_soul_declaration(soul_decl, user_name=current_user_name)
-            added = int(rec.get("added") or 0)
-            items = rec.get("items") if isinstance(rec.get("items"), list) else []
-            summary = str(rec.get("summary") or "").strip()
-            lines = [f"已更新全局记忆 soul.md（新增 {added} 条）。"]
-            if summary:
-                lines.append(f"总结：{summary}")
-            if items:
-                lines.append("本次记录：")
-                lines.extend([f"- {str(item).strip()}" for item in items if str(item).strip()])
-            self.feishu.send_text(chat_id, "\n".join(lines))
-            return
-
-        if self._try_handle_text_shortcut(runtime_chat_id=worker_chat_id, reply_chat_id=chat_id, raw=raw):
-            return
-
         active_project = self._ensure_active_project(worker_chat_id)
         runtime_key = self._ensure_project_runtime(worker_chat_id, active_project) if active_project else worker_chat_id
         pending_files = self._consume_pending_files(runtime_key)
-        system_context = self._build_injected_system_context(
-            chat_id=chat_id,
-            sender_id=sender_meta,
-            sender_name=current_user_name,
-        )
-        prompt, image_paths = self._build_prompt_with_files(raw, pending_files, system_context=system_context)
+        prompt, image_paths = self._build_prompt_with_files(raw, pending_files)
         typing_reaction_id = ""
         progress_stop = threading.Event()
         progress_thread: Optional[threading.Thread] = None
@@ -3165,7 +2618,6 @@ class AppServerBotBridge:
             return
 
         sender_id = sender.get("sender_id") if isinstance(sender.get("sender_id"), dict) else {}
-        sender_name = str(sender.get("sender_name") or sender.get("name") or "").strip()
         sender_open_id = str(sender_id.get("open_id") or "").strip()
         sender_user_id = str(sender_id.get("user_id") or "").strip()
         sender_union_id = str(sender_id.get("union_id") or "").strip()
@@ -3188,14 +2640,7 @@ class AppServerBotBridge:
         if msg_type == "text":
             text = str(content.get("text") or "").strip()
             message_id = str(message.get("message_id") or "").strip()
-            self._handle_text(
-                chat_id,
-                text,
-                runtime_chat_id=runtime_chat_id,
-                message_id=message_id,
-                sender_id=sender_id,
-                sender_name=sender_name,
-            )
+            self._handle_text(chat_id, text, runtime_chat_id=runtime_chat_id, message_id=message_id)
             return
 
         if msg_type in SUPPORTED_ATTACHMENT_TYPES:
@@ -3235,14 +2680,7 @@ class AppServerBotBridge:
                         )
 
             if post_text:
-                self._handle_text(
-                    chat_id,
-                    post_text,
-                    runtime_chat_id=runtime_chat_id,
-                    message_id=message_id,
-                    sender_id=sender_id,
-                    sender_name=sender_name,
-                )
+                self._handle_text(chat_id, post_text, runtime_chat_id=runtime_chat_id, message_id=message_id)
                 return
 
             staged = len(self._list_pending_files(self._runtime_key(runtime_chat_id)))
@@ -3263,7 +2701,7 @@ class AppServerBotBridge:
 
         if not event_key:
             return
-        action = str(self.menu_actions.get(event_key) or DEFAULT_MENU_ACTIONS.get(event_key) or "").strip()
+        action = str(self.menu_actions.get(event_key) or "").strip()
         if not action:
             if open_id:
                 self.feishu.send_text_by_receive_id(open_id, f"未配置菜单动作: {event_key}", receive_id_type="open_id")
@@ -3388,15 +2826,25 @@ class AppServerBotBridge:
 
         if op == "project_switch":
             project = str(value.get("project") or "").strip()
-            self._switch_active_project(runtime_chat_id=runtime_chat_id, reply_chat_id=reply_chat_id, project=project)
-            return
-
-        if op == "project_switch_last":
-            project = self._latest_project_runtime(runtime_chat_id) or self._preferred_active_project(runtime_chat_id)
-            if not project:
-                self.feishu.send_text(reply_chat_id, "未找到可切换的项目。")
+            cwd = str(self.projects.get(project) or "").strip()
+            if not cwd:
+                self.feishu.send_text(reply_chat_id, f"未知项目: {project}")
                 return
-            self._switch_active_project(runtime_chat_id=runtime_chat_id, reply_chat_id=reply_chat_id, project=project)
+            try:
+                self._set_await_project_name(runtime_chat_id, False)
+                self._set_active_project(runtime_chat_id, project)
+                runtime_key = self._ensure_project_runtime(runtime_chat_id, project)
+                status = self.control.status(runtime_key).get("data") if runtime_key else {}
+                thread_id = str((status or {}).get("thread_id") or "").strip()
+                last_turn_id = str(((status or {}).get("state") or {}).get("last_turn_id") or (status or {}).get("last_turn_id") or "").strip()
+                last_user_text = str(((status or {}).get("state") or {}).get("last_user_text") or (status or {}).get("last_user_text") or "").strip()
+                has_history = bool(thread_id or last_turn_id or last_user_text)
+                if has_history:
+                    self.feishu.send_text(reply_chat_id, f"已切换到项目: {project}\n下一条消息会继续该项目最近会话。")
+                else:
+                    self.feishu.send_text(reply_chat_id, f"已切换到项目: {project}\n该项目暂时还没有历史会话，下一条消息会新开一条。")
+            except Exception as exc:
+                self.feishu.send_text(reply_chat_id, f"切换项目失败: {exc}")
             return
 
         if op == "project_create_begin":
@@ -3413,11 +2861,6 @@ class AppServerBotBridge:
                 self.feishu.send_text(reply_chat_id, _trim(f"中断结果:\n{json.dumps(result, ensure_ascii=False)}", 900))
             except Exception as exc:
                 self.feishu.send_text(reply_chat_id, f"中断失败: {exc}")
-            return
-
-        if op == "session_status":
-            answer = self._status_text(scoped_runtime_chat_id)
-            self.feishu.smart_send(reply_chat_id, _trim(answer, 3000), title="Codex /status")
             return
 
         if op == "session_cmd":
@@ -3476,10 +2919,7 @@ class AppServerBotBridge:
             if not model:
                 self.feishu.send_text(reply_chat_id, "未选择模型")
                 return
-            apply_payload: Dict[str, Any] = {"model": model, "effort": "high"}
-            if target_project:
-                apply_payload["project"] = target_project
-            self._run_card_action(chat_id=runtime_chat_id, op="session_model_apply", value=apply_payload)
+            self.feishu.send_card(reply_chat_id, self._build_effort_select_card(model, project_name=target_project))
             return
 
         if op == "session_model_apply":
