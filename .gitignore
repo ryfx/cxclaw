@@ -20,6 +20,9 @@ config.local.json
 # Runtime state/uploads
 data/*
 !data/.gitkeep
+tmp/*
+!tmp/.gitkeep
+soul.md
 
 # Local design references
 reference/
