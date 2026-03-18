@@ -11,6 +11,7 @@
 - 长回复使用 Feishu `schema 2.0` markdown 卡片渲染。
 - 支持 OpenClaw 风格的 CardKit streaming card 和消息 reaction typing 状态。
 - 会话在无任务执行且 10 分钟无新消息时自动回收，后续可通过 Codex `resume` 恢复。
+- 支持全局 `soul.md` 记忆，沉淀跨项目偏好。
 
 ## 前置条件
 
@@ -25,12 +26,19 @@
 ./scripts/init.sh
 ```
 
-然后编辑 `.env`，至少填写以下配置：
+初始化完成后，先准备配置文件：
+
+```bash
+cp .env.example .env
+```
+
+至少填写以下配置：
 
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
+- `BRIDGE_API_TOKEN`
 
-分别在两个终端启动：
+然后分别在两个终端启动：
 
 ```bash
 ./scripts/run_api.sh
@@ -39,6 +47,25 @@
 ```bash
 ./scripts/run_bridge.sh
 ```
+
+### 配置 soul 全局记忆（可选）
+
+仓库提供样例文件：[soul.md.example](./soul.md.example)。
+
+```bash
+cp soul.md.example soul.md
+```
+
+并在 `.env` 中确认：
+
+- `BRIDGE_SOUL_ENABLED=true`
+- `BRIDGE_SOUL_PATH=./soul.md`
+
+说明：
+
+- `soul.md` 是全局长期偏好文件，只放跨项目、长期有效的信息
+- 不要写密钥、口令、令牌等敏感信息
+- `soul.md` 已加入 `.gitignore`，不会被提交，避免隐私泄露
 
 ## 飞书后台配置
 
@@ -104,6 +131,10 @@
 - 输出文件数量上限：`BRIDGE_OUTPUT_FILE_MAX_COUNT=0`
 - 输出文件大小上限：`BRIDGE_OUTPUT_FILE_MAX_SIZE_MB=30`
 - 输出文件扫描年龄：`BRIDGE_OUTPUT_FILE_MAX_AGE_SEC=3600`
+- 全局记忆开关：`BRIDGE_SOUL_ENABLED=true`
+- 全局记忆路径：`BRIDGE_SOUL_PATH=./soul.md`
+- 记忆注入长度上限：`BRIDGE_SOUL_MAX_PROMPT_CHARS=6000`
+- 记忆条目上限：`BRIDGE_SOUL_MAX_BULLETS=200`
 - 默认文件回传 MCP 名称：`BRIDGE_MCP_SERVER_NAME=feishu-bridge-files`
 - MCP 文件允许目录：`BRIDGE_MCP_FILE_ALLOWED_DIRS=/root/bridgespace/projects`
 - MCP 文件大小上限：`BRIDGE_MCP_FILE_MAX_SIZE_MB=30`
